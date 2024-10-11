@@ -1,0 +1,9 @@
+[package]
+name = "alp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fastlanes = "0.1"
+num-traits = "0.2.19"
+serde = { version = "1", optional = true, features = ["derive"] }
