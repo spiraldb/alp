@@ -25,6 +25,38 @@ mod private {
     impl Sealed for f64 {}
 }
 
+/// Encodes an array of floating-point values into an integer representation, if an exponent set is not provided it will find one.
+/// Returns the exponent set, vec of encoded values, and exceptions and their positions.
+pub fn encode<F: ALPFloat>(
+    values: &[F],
+    exponents: Option<Exponents>,
+) -> (Exponents, Vec<F::ALPInt>, Vec<u64>, Vec<F>) {
+    F::encode(values, exponents)
+}
+
+/// Finds the best exponent pair for a given set of values, trying to minimize the number of exceptions.
+pub fn find_best_exponents<F: ALPFloat>(values: &[F]) -> Exponents {
+    F::find_best_exponents(values)
+}
+
+/// Encodes a single
+pub fn encode_single<F: ALPFloat>(value: F, exponents: Exponents) -> Result<F::ALPInt, F> {
+    F::encode_single(value, exponents)
+}
+
+/// Decodes an integer value to its matching floating point representation given the same exponents.
+pub fn decode_single<F: ALPFloat>(encoded: F::ALPInt, exponents: Exponents) -> F {
+    F::from_int(encoded) * F::F10[exponents.f as usize] * F::IF10[exponents.e as usize]
+}
+
+/// Encodes a single value, it might not round-trip back it its original value
+#[inline(always)]
+pub unsafe fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
+    (value * F::F10[exponents.e as usize] * F::IF10[exponents.f as usize])
+        .fast_round()
+        .as_int()
+}
+
 pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     type ALPInt: PrimInt + Display + ToPrimitive;
 
@@ -80,12 +112,11 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
 
     #[inline]
     fn estimate_encoded_size(encoded: &[Self::ALPInt], patches: &[Self]) -> usize {
-        let minmax = encoded.iter()
-            .fold(None, |minmax, next| {
-                let (min, max) = minmax.unwrap_or((next, next));
+        let minmax = encoded.iter().fold(None, |minmax, next| {
+            let (min, max) = minmax.unwrap_or((next, next));
 
-                Some((min.min(next), max.max(next)))
-            });
+            Some((min.min(next), max.max(next)))
+        });
         let bits_per_encoded = minmax
             // estimating bits per encoded value assuming frame-of-reference + bitpacking-without-patches
             .and_then(|(min, max)| max.checked_sub(min))
