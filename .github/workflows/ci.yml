@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ["develop"]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+
+
+      - name: Rust Build
+        run: cargo build --all-features --all-targets
+      - name: Rust Lint - Format
+        run: cargo fmt --all --check
+      - name: Rust Lint - Clippy
+        run: cargo clippy --all-features --all-targets
+      - name: Rust Test
+        run: cargo test --workspace --all-features
+
+  bench-codspeed:
+    name: Benchmark with Codspeed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+
+      - name: Install Codspeed
+        shell: bash
+        run: cargo install --force cargo-codspeed --locked
+
+      - name: Build benchmarks
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: |
+          cargo codspeed build --profile bench
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v3
+        with:
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
