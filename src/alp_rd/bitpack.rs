@@ -12,16 +12,13 @@ pub struct PackedVec<T> {
 }
 
 /// Bitpack a slice of primitives down to the given width using the FastLanes layout.
-pub(crate) fn fastlanes_pack<T: BitPacking>(
-    array: &[T],
-    bit_width: usize,
-) -> Vec<T> {
+pub(crate) fn fastlanes_pack<T: BitPacking>(array: &[T], bit_width: usize) -> Vec<T> {
     if bit_width == 0 {
         return Vec::new();
     }
 
     // How many fastlanes vectors we will process.
-    let num_chunks = (array.len() + 1023) / 1024;
+    let num_chunks = array.len().div_ceil(1024);
     let num_full_chunks = array.len() / 1024;
     let packed_len = 128 * bit_width / size_of::<T>();
     // packed_len says how many values of size T we're going to include.
@@ -68,7 +65,6 @@ pub(crate) fn fastlanes_pack<T: BitPacking>(
     output
 }
 
-
 pub(crate) fn fastlanes_unpack<T: BitPacking>(
     packed: &[T],
     bit_width: usize,
@@ -81,7 +77,7 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
 
     // How many fastlanes vectors we will process.
     // Packed array might not start at 0 when the array is sliced. Offset is guaranteed to be < 1024.
-    let num_chunks = (offset + length + 1023) / 1024;
+    let num_chunks = (offset + length).div_ceil(1024);
     let elems_per_chunk = 128 * bit_width / size_of::<T>();
     assert_eq!(
         packed.len(),
@@ -135,9 +131,7 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
     output
 }
 
-
 // TODO: add fastlanes_unpack_dict that fuses dictionary lookup with unpacking.
-
 
 #[cfg(test)]
 mod test {

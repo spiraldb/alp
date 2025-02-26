@@ -147,7 +147,7 @@ impl<T, U> Split<T, U> {
             self.left_dict,
             self.left_exceptions,
             self.right_parts,
-            self.right_parts_bit_width
+            self.right_parts_bit_width,
         )
     }
 
@@ -159,7 +159,7 @@ impl<T, U> Split<T, U> {
 
 impl<F, U> Split<F, U>
 where
-    F: ALPRDFloat<UINT=U>,
+    F: ALPRDFloat<UINT = U>,
 {
     /// Decode back into a vector of the floating point type.
     pub fn decode(&self) -> Vec<F> {
@@ -212,7 +212,6 @@ impl RDEncoder {
         // mask for right-parts
         let right_mask = T::UINT::one().shl(self.right_bit_width as _) - T::UINT::one();
         let max_code = self.codes.len() - 1;
-        let left_bit_width = bit_width!(max_code);
 
         for v in doubles.iter().copied() {
             right_parts.push(T::to_bits(v) & right_mask);
@@ -412,15 +411,9 @@ mod test {
 
     #[test]
     fn test_encode_decode() {
-        let values = vec![
-            1.12345f64,
-            2.34567f64,
-            3.45678f64,
-        ];
+        let values = vec![1.12345f64, 2.34567f64, 3.45678f64];
 
-        let encoder = RDEncoder::new(
-            &values
-        );
+        let encoder = RDEncoder::new(&values);
 
         let split = encoder.split(&values);
         let decoded = split.decode();
