@@ -42,7 +42,9 @@ where
 
     /// Apply the exceptions to the given array.
     pub fn apply(&self, vec: &mut [T]) {
-        self.values.iter().zip(self.positions.iter())
+        self.values
+            .iter()
+            .zip(self.positions.iter())
             .for_each(|(value, pos)| vec[*pos as usize] = *value);
     }
 }
@@ -53,10 +55,7 @@ mod test {
 
     #[test]
     fn test_apply_exceptions() {
-        let exceptions = Exceptions::new(
-            vec![0u8; 4],
-            vec![1, 2, 3],
-        );
+        let exceptions = Exceptions::new(vec![0u8; 4], vec![1, 2, 3]);
 
         let mut values = vec![10; 4];
         exceptions.apply(&mut values);
