@@ -9,12 +9,17 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Rust Version
+      id: rust-version
+      shell: bash
+      run: echo "version=$(cat rust-toolchain.toml | grep channel | awk -F'\"' '{print $2}')" >> $GITHUB_OUTPUT
+
     - name: Rust Toolchain
       id: rust-toolchain
       uses: dtolnay/rust-toolchain@master
       if: steps.rustup-cache.outputs.cache-hit != 'true'
       with:
-        toolchain: stable
+        toolchain: "${{ steps.rust-version.outputs.version }}"
         targets: "${{inputs.targets || ''}}"
         components: clippy, rustfmt, llvm-tools-preview
 
