@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use fastlanes::BitPacking;
 
 /// A bit-packed vector with a fixed bit-width.

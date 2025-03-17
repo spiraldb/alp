@@ -211,7 +211,7 @@ impl RDEncoder {
 
         // mask for right-parts
         let right_mask = T::UINT::one().shl(self.right_bit_width as _) - T::UINT::one();
-        let max_code = self.codes.len() - 1;
+        // let max_code = self.codes.len() - 1;
 
         for v in doubles.iter().copied() {
             right_parts.push(T::to_bits(v) & right_mask);

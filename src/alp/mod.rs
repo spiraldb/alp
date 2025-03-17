@@ -50,6 +50,9 @@ pub fn decode_single<F: ALPFloat>(encoded: F::ALPInt, exponents: Exponents) -> F
 }
 
 /// Encodes a single value, it might not round-trip back it its original value
+/// # Safety
+///
+/// The returned value may not decode back to the original value.
 #[inline(always)]
 pub unsafe fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
     (value * F::F10[exponents.e as usize] * F::IF10[exponents.f as usize])
