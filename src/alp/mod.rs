@@ -50,6 +50,9 @@ pub fn decode_single<F: ALPFloat>(encoded: F::ALPInt, exponents: Exponents) -> F
 }
 
 /// Encodes a single value, it might not round-trip back it its original value
+/// # Safety
+///
+/// The returned value may not decode back to the original value.
 #[inline(always)]
 pub unsafe fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
     (value * F::F10[exponents.e as usize] * F::IF10[exponents.f as usize])
@@ -129,7 +132,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             })
             .unwrap_or(size_of::<Self::ALPInt>() * 8);
 
-        let encoded_bytes = (encoded.len() * bits_per_encoded + 7) / 8;
+        let encoded_bytes = (encoded.len() * bits_per_encoded).div_ceil(8);
         // each patch is a value + a position
         // in practice, patch positions are in [0, u16::MAX] because of how we chunk
         let patch_bytes = patches.len() * (size_of::<Self>() + size_of::<u16>());
