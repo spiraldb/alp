@@ -1,7 +1,7 @@
+use itertools::Itertools;
+use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
-
-use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 
 const SAMPLE_SIZE: usize = 32;
 
@@ -46,7 +46,7 @@ pub fn encode_single<F: ALPFloat>(value: F, exponents: Exponents) -> Result<F::A
 
 /// Decodes an integer value to its matching floating point representation given the same exponents.
 pub fn decode_single<F: ALPFloat>(encoded: F::ALPInt, exponents: Exponents) -> F {
-    F::from_int(encoded) * F::F10[exponents.f as usize] * F::IF10[exponents.e as usize]
+    F::decode_single(encoded, exponents)
 }
 
 /// Encodes a single value, it might not round-trip back it its original value
@@ -54,10 +54,8 @@ pub fn decode_single<F: ALPFloat>(encoded: F::ALPInt, exponents: Exponents) -> F
 ///
 /// The returned value may not decode back to the original value.
 #[inline(always)]
-pub unsafe fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
-    (value * F::F10[exponents.e as usize] * F::IF10[exponents.f as usize])
-        .fast_round()
-        .as_int()
+pub fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
+    F::encode_single_unchecked(value, exponents)
 }
 
 pub trait ALPFloat: private::Sealed + Float + Display + 'static {
@@ -81,16 +79,18 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// Convert from the integer type back to the float type using `as`.
     fn from_int(n: Self::ALPInt) -> Self;
 
+    fn is_eq(self, other: Self) -> bool;
+
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let mut best_exp = Exponents { e: 0, f: 0 };
         let mut best_nbytes: usize = usize::MAX;
 
-        let sample: Option<Vec<Self>> = (values.len() > SAMPLE_SIZE).then(|| {
+        let sample = (values.len() > SAMPLE_SIZE).then(|| {
             values
                 .iter()
                 .step_by(values.len() / SAMPLE_SIZE)
                 .cloned()
-                .collect()
+                .collect_vec()
         });
 
         for e in (0..Self::MAX_EXPONENT).rev() {
@@ -115,12 +115,10 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
 
     #[inline]
     fn estimate_encoded_size(encoded: &[Self::ALPInt], patches: &[Self]) -> usize {
-        let minmax = encoded.iter().fold(None, |minmax, next| {
-            let (min, max) = minmax.unwrap_or((next, next));
-
-            Some((min.min(next), max.max(next)))
-        });
-        let bits_per_encoded = minmax
+        let bits_per_encoded = encoded
+            .iter()
+            .minmax()
+            .into_option()
             // estimating bits per encoded value assuming frame-of-reference + bitpacking-without-patches
             .and_then(|(min, max)| max.checked_sub(min))
             .and_then(|range_size: <Self as ALPFloat>::ALPInt| range_size.to_u64())
@@ -168,11 +166,23 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         (exp, encoded_output, patch_indices, patch_values)
     }
 
+    fn encode_above(value: Self, exponents: Exponents) -> Self::ALPInt {
+        (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
+            .ceil()
+            .as_int()
+    }
+
+    fn encode_below(value: Self, exponents: Exponents) -> Self::ALPInt {
+        (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
+            .floor()
+            .as_int()
+    }
+
     #[inline]
     fn encode_single(value: Self, exponents: Exponents) -> Result<Self::ALPInt, Self> {
-        let encoded = unsafe { Self::encode_single_unchecked(value, exponents) };
+        let encoded = Self::encode_single_unchecked(value, exponents);
         let decoded = Self::decode_single(encoded, exponents);
-        if decoded == value {
+        if decoded.is_eq(value) {
             return Ok(encoded);
         }
         Err(value)
@@ -183,11 +193,9 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         Self::from_int(encoded) * Self::F10[exponents.f as usize] * Self::IF10[exponents.e as usize]
     }
 
-    /// # Safety
-    ///
-    /// The returned value may not decode back to the original value.
+    /// Encodes a single value, it might not round-trip back it its original value
     #[inline(always)]
-    unsafe fn encode_single_unchecked(value: Self, exponents: Exponents) -> Self::ALPInt {
+    fn encode_single_unchecked(value: Self, exponents: Exponents) -> Self::ALPInt {
         (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
             .fast_round()
             .as_int()
@@ -209,10 +217,10 @@ fn encode_chunk_unchecked<T: ALPFloat>(
 
     // encode the chunk, counting the number of patches
     let mut chunk_patch_count = 0;
-    encoded_output.extend(chunk.iter().map(|v| {
-        let encoded = unsafe { T::encode_single_unchecked(*v, exp) };
+    encoded_output.extend(chunk.iter().map(|&v| {
+        let encoded = encode_single_unchecked(v, exp);
         let decoded = T::decode_single(encoded, exp);
-        let neq = (decoded != *v) as usize;
+        let neq = !decoded.is_eq(v) as usize;
         chunk_patch_count += neq;
         encoded
     }));
@@ -309,6 +317,10 @@ impl ALPFloat for f32 {
     fn from_int(n: Self::ALPInt) -> Self {
         n as _
     }
+
+    fn is_eq(self, other: Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
 }
 
 impl ALPFloat for f64 {
@@ -379,5 +391,9 @@ impl ALPFloat for f64 {
     #[inline(always)]
     fn from_int(n: Self::ALPInt) -> Self {
         n as _
+    }
+
+    fn is_eq(self, other: Self) -> bool {
+        self.to_bits() == other.to_bits()
     }
 }
