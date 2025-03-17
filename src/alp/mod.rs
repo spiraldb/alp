@@ -242,7 +242,7 @@ fn encode_chunk_unchecked<T: ALPFloat>(
             // write() is only safe to call more than once because the values are primitive (i.e., Drop is a no-op)
             patch_indices_mut[chunk_patch_index].write(i as u64);
             patch_values_mut[chunk_patch_index].write(chunk[i - num_prev_encoded]);
-            chunk_patch_index += (decoded != chunk[i - num_prev_encoded]) as usize;
+            chunk_patch_index += !decoded.is_eq(chunk[i - num_prev_encoded]) as usize;
         }
         assert_eq!(chunk_patch_index, chunk_patch_count);
         unsafe {
@@ -395,5 +395,19 @@ impl ALPFloat for f64 {
 
     fn is_eq(self, other: Self) -> bool {
         self.to_bits() == other.to_bits()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_numbers() {
+        let original = vec![0.0f32, -0.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY];
+        let (_, encoded, patch_idx, _) = encode(&original, None);
+
+        assert_eq!(patch_idx, vec![1, 2, 3, 4]);
+        assert_eq!(encoded, vec![0, 0, 0, 0, 0]);
     }
 }
