@@ -4,6 +4,7 @@ use crate::Exceptions;
 use fastlanes::BitPacking;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
 use rustc_hash::FxHashMap;
+use std::cmp::Reverse;
 use std::marker::PhantomData;
 use std::ops::{Shl, Shr};
 
@@ -22,6 +23,17 @@ pub const CUT_LIMIT: usize = 16;
 
 /// Maximum number of entries in the left-parts dictionary.
 pub const MAX_DICT_SIZE: u8 = 8;
+
+/// Maximum number of samples examined during dictionary search.
+///
+/// When the input is at least `2 * MAX_SAMPLE` elements long, [`find_best_dictionary`] strides
+/// through it so that the search costs O(`MAX_SAMPLE`) rather than O(N). Below that threshold
+/// the stride is one and every element is examined.
+///
+/// 4096 samples is enough to identify the dominant left-bit patterns: in practice the top-8
+/// patterns emerge within the first few hundred values, and the chosen `right_bit_width` matches
+/// the full-scan result (see `test_subsampling_matches_full_cut_point`).
+const MAX_SAMPLE: usize = 4096;
 
 mod private {
     pub trait Sealed {}
@@ -124,6 +136,39 @@ impl ALPRDFloat for f32 {
 pub struct RDEncoder {
     right_bit_width: u8,
     codes: Vec<u16>,
+    /// Reverse lookup: a raw left-bit pattern indexes the table, and the entry holds its
+    /// dictionary code + 1, or zero if the pattern is not in the dictionary.
+    ///
+    /// 64KB, so it fits in L2. Built once per encoder, replacing the O(dictionary size) linear
+    /// scan that [`RDEncoder::split_parts`] would otherwise run for every element.
+    lookup: Box<[u8; 65536]>,
+}
+
+/// Builds the reverse lookup table used to dictionary-encode left parts.
+///
+/// The `code + 1` sentinel encoding lets a zero entry mean "not in the dictionary" without
+/// widening the table to hold an `Option`, keeping it at 64KB.
+///
+/// # Panics
+///
+/// Panics if `codes` holds more than [`MAX_DICT_SIZE`] entries.
+fn build_lookup(codes: &[u16]) -> Box<[u8; 65536]> {
+    assert!(
+        codes.len() <= MAX_DICT_SIZE as usize,
+        "RDEncoder dictionary larger than MAX_DICT_SIZE"
+    );
+
+    // Heap-allocated, to avoid placing 64KB on the stack.
+    let mut lookup = vec![0u8; 65536];
+    for (code, &bits) in codes.iter().enumerate() {
+        // `code + 1` fits in a u8 because `codes.len() <= MAX_DICT_SIZE`.
+        lookup[bits as usize] = code as u8 + 1;
+    }
+
+    lookup
+        .into_boxed_slice()
+        .try_into()
+        .expect("lookup table must be exactly 65536 bytes")
 }
 
 /// The "cut" ALP-RD vector.
@@ -137,8 +182,12 @@ pub struct Split<F, U> {
     /// Exceptions for the `left_parts` that could not be dictionary encoded.
     left_exceptions: Exceptions<u16>,
 
-    /// Dictionary for encoding the `left_parts`.
-    left_dict: Vec<u16>,
+    /// Dictionary for encoding the `left_parts`, held inline so that a split does not need a
+    /// heap allocation for it. Only the first `left_dict_len` entries are meaningful.
+    left_dict: [u16; MAX_DICT_SIZE as usize],
+
+    /// Number of live entries in `left_dict`.
+    left_dict_len: u8,
 
     /// Bit-width for the `left_parts` codes.
     left_parts_bit_width: u8,
@@ -155,9 +204,11 @@ pub struct Split<F, U> {
 impl<T, U> Split<T, U> {
     /// Consumes the parts of the result.
     pub fn into_parts(self) -> (Vec<u16>, Vec<u16>, Exceptions<u16>, Vec<U>, u8) {
+        // Materialise the inline dictionary into a `Vec` only here, on the rare path.
+        let left_dict = self.left_dict[..self.left_dict_len as usize].to_vec();
         (
             self.left_parts,
-            self.left_dict,
+            left_dict,
             self.left_exceptions,
             self.right_parts,
             self.right_parts_bit_width,
@@ -171,7 +222,7 @@ impl<T, U> Split<T, U> {
 
     /// Returns the dictionary used to encode the left parts.
     pub fn left_dict(&self) -> &[u16] {
-        &self.left_dict
+        &self.left_dict[..self.left_dict_len as usize]
     }
 
     /// Returns the exceptions of the left parts.
@@ -203,7 +254,7 @@ where
     pub fn decode(&self) -> Vec<F> {
         alp_rd_decode(
             &self.left_parts,
-            &self.left_dict,
+            self.left_dict(),
             self.right_parts_bit_width,
             &self.right_parts,
             &self.left_exceptions.positions,
@@ -214,6 +265,9 @@ where
 
 impl RDEncoder {
     /// Builds a new encoder from a sample of doubles.
+    ///
+    /// When `sample` is at least `2 * MAX_SAMPLE` elements long, the dictionary search strides
+    /// through it so that it examines at most `MAX_SAMPLE` elements rather than every element.
     ///
     /// # Panics
     ///
@@ -235,18 +289,27 @@ impl RDEncoder {
             codes[code as usize] = bits
         });
 
+        let lookup = build_lookup(&codes);
+
         Self {
             right_bit_width: dictionary.right_bit_width,
             codes,
+            lookup,
         }
     }
 
     /// Builds a new encoder from known parameters.
-    #[inline]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `codes` holds more than [`MAX_DICT_SIZE`] entries.
     pub fn from_parts(right_bit_width: u8, codes: Vec<u16>) -> Self {
+        let lookup = build_lookup(&codes);
+
         Self {
             right_bit_width,
             codes,
+            lookup,
         }
     }
 
@@ -278,9 +341,14 @@ impl RDEncoder {
         // TODO(aduffy): pack the exception positions.
         let left_exceptions = Exceptions::new(exception_values, exception_pos);
 
+        // `build_lookup` has already established that the dictionary fits inline.
+        let mut left_dict = [0u16; MAX_DICT_SIZE as usize];
+        left_dict[..self.codes.len()].copy_from_slice(&self.codes);
+
         Split {
             left_parts,
-            left_dict: self.codes.clone(),
+            left_dict,
+            left_dict_len: self.codes.len() as u8,
             left_exceptions,
             left_parts_bit_width: self.left_bit_width(),
             right_parts,
@@ -312,23 +380,22 @@ impl RDEncoder {
         // Mask for the right parts.
         let right_mask = T::UINT::one().shl(self.right_bit_width as _) - T::UINT::one();
 
-        for v in doubles.iter().copied() {
-            right_parts.push(T::to_bits(v) & right_mask);
-            left_parts.push(<T as ALPRDFloat>::to_u16(
-                T::to_bits(v).shr(self.right_bit_width as _),
-            ));
-        }
+        // Single pass: split each value into its halves, dictionary-encode the left half through
+        // the reverse lookup table, and record any pattern missing from the dictionary as an
+        // exception.
+        for (idx, v) in doubles.iter().copied().enumerate() {
+            let bits = T::to_bits(v);
+            right_parts.push(bits & right_mask);
 
-        // Dict-encode the left parts, keeping track of exceptions.
-        for (idx, left) in left_parts.iter_mut().enumerate() {
-            // TODO: revisit if we need to change the branch order for perf.
-            if let Some(code) = self.codes.iter().position(|v| *v == *left) {
-                *left = code as u16;
+            let left_raw = <T as ALPRDFloat>::to_u16(bits.shr(self.right_bit_width as _));
+            let code_plus_one = self.lookup[left_raw as usize];
+            if code_plus_one != 0 {
+                left_parts.push(u16::from(code_plus_one) - 1);
             } else {
-                exception_values.push(*left);
-                exception_pos.push(idx as _);
+                exception_values.push(left_raw);
+                exception_pos.push(idx as u64);
 
-                *left = 0u16;
+                left_parts.push(0u16);
             }
         }
 
@@ -502,19 +569,34 @@ pub fn alp_rd_combine_codes_inplace<T: ALPRDFloat>(
 
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
 /// estimated compressed size.
+///
+/// All [`CUT_LIMIT`] candidate cut points are tried. Each counting pass is O(`MAX_SAMPLE`) once
+/// `samples` is long enough to be strided, and the 256KB counting buffer is allocated once and
+/// reused across every trial.
 fn find_best_dictionary<T: ALPRDFloat>(samples: &[T]) -> ALPRDDictionary {
+    let stride = (samples.len() / MAX_SAMPLE).max(1);
+    let effective_count = samples.len().div_ceil(stride);
+
     let mut best_est_size = f64::MAX;
     let mut best_dict = ALPRDDictionary::default();
 
+    // Allocated once; `build_left_parts_dictionary` clears it on entry.
+    let mut counts = vec![0u32; 65536];
+
     for p in 1..=CUT_LIMIT {
         let candidate_right_bw = (T::BITS - p) as u8;
-        let (dictionary, exception_count) =
-            build_left_parts_dictionary::<T>(samples, candidate_right_bw, MAX_DICT_SIZE);
+        let (dictionary, exception_count) = build_left_parts_dictionary::<T>(
+            samples,
+            stride,
+            candidate_right_bw,
+            MAX_DICT_SIZE,
+            &mut counts,
+        );
         let estimated_size = estimate_compression_size(
             dictionary.right_bit_width,
             dictionary.left_bit_width,
             exception_count,
-            samples.len(),
+            effective_count,
         );
         if estimated_size < best_est_size {
             best_est_size = estimated_size;
@@ -525,28 +607,45 @@ fn find_best_dictionary<T: ALPRDFloat>(samples: &[T]) -> ALPRDDictionary {
     best_dict
 }
 
-/// Builds a dictionary of the leftmost bits.
+/// Builds a dictionary of the leftmost bits, counting pattern frequencies in a direct-addressed
+/// array.
+///
+/// Left-bit patterns are `u16` values, so a pattern indexes the frequency array directly — no
+/// hashing and no collisions, O(1) per element. `counts` is supplied by the caller so that the
+/// 256KB buffer is allocated only once across all cut-point trials; it is cleared on entry.
+///
+/// Only every `stride`-th sample is counted.
 fn build_left_parts_dictionary<T: ALPRDFloat>(
     samples: &[T],
+    stride: usize,
     right_bw: u8,
     max_dict_size: u8,
+    counts: &mut [u32],
 ) -> (ALPRDDictionary, usize) {
     assert!(
         right_bw >= (T::BITS - CUT_LIMIT) as _,
         "left-parts must be <= 16 bits"
     );
 
+    counts.fill(0);
+
     // Count the number of occurrences of each left bit pattern.
-    let mut counts = FxHashMap::default();
     samples
         .iter()
+        .step_by(stride)
         .copied()
         .map(|v| <T as ALPRDFloat>::to_u16(T::to_bits(v).shr(right_bw as _)))
-        .for_each(|item| *counts.entry(item).or_default() += 1);
+        .for_each(|item| counts[item as usize] += 1);
 
-    // Sorted counts: sort by negative count so that heavy hitters sort first.
-    let mut sorted_bit_counts: Vec<(u16, usize)> = counts.into_iter().collect();
-    sorted_bit_counts.sort_by_key(|(_, count)| count.wrapping_neg());
+    // Collect the patterns that actually occurred, sorting so that heavy hitters come first.
+    let mut sorted_bit_counts: Vec<(u16, u32)> = counts
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, count)| count > 0)
+        .map(|(bits, count)| (bits as u16, count))
+        .collect();
+    sorted_bit_counts.sort_unstable_by_key(|(_, count)| Reverse(*count));
 
     // Assign the most-frequently occurring left-bits as dictionary codes, up to `dict_size`...
     let mut dictionary =
@@ -562,11 +661,11 @@ fn build_left_parts_dictionary<T: ALPRDFloat>(
     let exception_count: usize = sorted_bit_counts
         .iter()
         .skip(code as _)
-        .map(|(_, count)| *count)
+        .map(|(_, count)| *count as usize)
         .sum();
 
     // Left bit-width is determined based on the actual dictionary size.
-    let max_code = dictionary.len() - 1;
+    let max_code = dictionary.len().saturating_sub(1);
     let left_bw = bit_width(max_code as u64);
 
     (
