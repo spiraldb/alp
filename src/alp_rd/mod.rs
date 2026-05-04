@@ -134,7 +134,9 @@ impl ALPRDFloat for f32 {
 ///
 /// [C++ implementation]: https://github.com/cwida/ALP/blob/main/include/alp/rd.hpp
 pub struct RDEncoder {
+    /// Number of bits kept in the right (LSB) half of each float's bit representation.
     right_bit_width: u8,
+    /// Forward mapping: `codes[code]` is the raw left-bit pattern that `code` encodes.
     codes: Vec<u16>,
     /// Reverse lookup: a raw left-bit pattern indexes the table, and the entry holds its
     /// dictionary code + 1, or zero if the pattern is not in the dictionary.
@@ -217,7 +219,14 @@ pub struct Split<F, U> {
 }
 
 impl<T, U> Split<T, U> {
-    /// Consumes the parts of the result.
+    /// Consumes the split into its raw components.
+    ///
+    /// Returns `(left_parts, left_dict, left_exceptions, right_parts, right_bit_width)`:
+    /// - `left_parts`: dictionary codes for the MSB halves, one per input value.
+    /// - `left_dict`: the dictionary mapping a code to its raw left-bit pattern.
+    /// - `left_exceptions`: values and positions that were not dictionary-encodable.
+    /// - `right_parts`: LSB halves, one per input value, each `right_bit_width` bits wide.
+    /// - `right_bit_width`: number of bits in each right-part element.
     pub fn into_parts(self) -> (Vec<u16>, Vec<u16>, Exceptions<u16>, Vec<U>, u8) {
         debug_assert!(
             self.left_dict_len <= MAX_DICT_SIZE,
@@ -713,8 +722,8 @@ fn estimate_compression_size(
     exception_count: usize,
     sample_n: usize,
 ) -> f64 {
-    const EXC_POSITION_SIZE: usize = 16; // two bytes for exception position.
-    const EXC_SIZE: usize = 16; // two bytes for each exception (up to 16 front bits).
+    const EXC_POSITION_SIZE: usize = 16; // 16 bits to store the exception position.
+    const EXC_SIZE: usize = 16; // up to 16 front bits per exception value.
 
     let exceptions_size = exception_count * (EXC_POSITION_SIZE + EXC_SIZE);
     (right_bw as f64) + (left_bw as f64) + ((exceptions_size as f64) / (sample_n as f64))
