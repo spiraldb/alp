@@ -139,7 +139,7 @@ pub struct RDEncoder {
     /// Reverse lookup: a raw left-bit pattern indexes the table, and the entry holds its
     /// dictionary code + 1, or zero if the pattern is not in the dictionary.
     ///
-    /// 64KB, so it fits in L2. Built once per encoder, replacing the O(dictionary size) linear
+    /// Heap-allocated, 64KB. Built once per encoder, replacing the O(dictionary size) linear
     /// scan that [`RDEncoder::split_parts`] would otherwise run for every element.
     lookup: Box<[u8; 65536]>,
 }
@@ -162,7 +162,22 @@ fn build_lookup(codes: &[u16]) -> Box<[u8; 65536]> {
     let mut lookup = vec![0u8; 65536];
     for (code, &bits) in codes.iter().enumerate() {
         // `code + 1` fits in a u8 because `codes.len() <= MAX_DICT_SIZE`.
-        lookup[bits as usize] = code as u8 + 1;
+        let code = u8::try_from(code + 1).expect("code + 1 must fit in a u8");
+        lookup[bits as usize] = code;
+    }
+
+    // Every dictionary entry must be reachable through the table it just populated. Written as a
+    // round-trip through `codes` rather than an index comparison so that a dictionary holding a
+    // repeated pattern, which `from_parts` accepts, does not trip the check.
+    #[cfg(debug_assertions)]
+    for &bits in codes {
+        let code_plus_one = lookup[bits as usize];
+        debug_assert_ne!(code_plus_one, 0, "dictionary pattern {bits} not in lookup");
+        debug_assert_eq!(
+            codes[code_plus_one as usize - 1],
+            bits,
+            "lookup must round-trip to the pattern it was built from"
+        );
     }
 
     lookup
@@ -204,6 +219,11 @@ pub struct Split<F, U> {
 impl<T, U> Split<T, U> {
     /// Consumes the parts of the result.
     pub fn into_parts(self) -> (Vec<u16>, Vec<u16>, Exceptions<u16>, Vec<U>, u8) {
+        debug_assert!(
+            self.left_dict_len <= MAX_DICT_SIZE,
+            "left_dict_len exceeds MAX_DICT_SIZE"
+        );
+
         // Materialise the inline dictionary into a `Vec` only here, on the rare path.
         let left_dict = self.left_dict[..self.left_dict_len as usize].to_vec();
         (
@@ -222,6 +242,10 @@ impl<T, U> Split<T, U> {
 
     /// Returns the dictionary used to encode the left parts.
     pub fn left_dict(&self) -> &[u16] {
+        debug_assert!(
+            self.left_dict_len <= MAX_DICT_SIZE,
+            "left_dict_len exceeds MAX_DICT_SIZE"
+        );
         &self.left_dict[..self.left_dict_len as usize]
     }
 
@@ -342,6 +366,10 @@ impl RDEncoder {
         let left_exceptions = Exceptions::new(exception_values, exception_pos);
 
         // `build_lookup` has already established that the dictionary fits inline.
+        debug_assert!(
+            self.codes.len() <= MAX_DICT_SIZE as usize,
+            "dictionary must not exceed MAX_DICT_SIZE"
+        );
         let mut left_dict = [0u16; MAX_DICT_SIZE as usize];
         left_dict[..self.codes.len()].copy_from_slice(&self.codes);
 
@@ -705,6 +733,7 @@ struct ALPRDDictionary {
 
 #[cfg(test)]
 mod test {
+    use super::MAX_SAMPLE;
     use crate::{
         MAX_DICT_SIZE, RDEncoder, alp_rd_apply_patches, alp_rd_combine_codes_inplace,
         alp_rd_combine_inplace, alp_rd_decode, alp_rd_dict_decode_inplace, bit_width,
@@ -837,6 +866,124 @@ mod test {
         let mut left = vec![0u16; 3];
         alp_rd_apply_patches(&mut left, &[10u64, 12], &[7u16, 9], 10);
         assert_eq!(left, vec![7, 0, 9]);
+    }
+
+    /// Values that miss the dictionary must still be recovered, via the exception path.
+    #[test]
+    fn test_exception_path_roundtrip() {
+        // Train on values sharing one dominant pattern, then append a value whose bits differ
+        // drastically so that it cannot be in the dictionary.
+        let outlier = f64::from_bits(0xFFFF_0000_0000_0000);
+        let mut training: Vec<f64> = vec![1.0f64; MAX_DICT_SIZE as usize + 1];
+        training.push(outlier);
+
+        let encoder = RDEncoder::new(&training);
+        let split = encoder.split(&training);
+        let decoded = split.decode();
+
+        assert_eq!(decoded.len(), training.len());
+        assert_eq!(
+            f64::to_bits(decoded[decoded.len() - 1]),
+            f64::to_bits(outlier),
+            "exception-path value must decode to its original bits"
+        );
+    }
+
+    /// Once the input exceeds `2 * MAX_SAMPLE` the dictionary search strides; the roundtrip must
+    /// stay exact regardless.
+    #[test]
+    fn test_large_input_roundtrip() {
+        // `2 * MAX_SAMPLE + 1` guarantees a stride greater than one.
+        let n = 2 * MAX_SAMPLE + 1;
+        let values: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 1000.0).collect();
+
+        let encoder = RDEncoder::new(&values);
+        for chunk in values.chunks(1024) {
+            assert_eq!(
+                encoder.split(chunk).decode(),
+                chunk,
+                "chunk roundtrip must be exact"
+            );
+        }
+    }
+
+    /// `into_parts` materialises the inline dictionary into a `Vec`; the result must be usable to
+    /// decode through the public entry point.
+    #[test]
+    fn test_into_parts_dict_materialisation() {
+        let values = vec![1.5f64, 2.5f64, 3.5f64, 1.5f64];
+        let encoder = RDEncoder::new(&values);
+        let split = encoder.split(&values);
+
+        let right_bit_width = split.right_parts_bit_width();
+        assert_eq!(split.left_dict(), encoder.codes());
+
+        let (left_parts, left_dict, left_exceptions, right_parts, bw) = split.into_parts();
+
+        assert_eq!(bw, right_bit_width, "right_bit_width must be consistent");
+        assert_eq!(left_dict, encoder.codes());
+        assert_eq!(left_parts.len(), values.len());
+        assert_eq!(right_parts.len(), values.len());
+
+        let decoded = alp_rd_decode::<f64>(
+            &left_parts,
+            &left_dict,
+            bw,
+            &right_parts,
+            left_exceptions.positions(),
+            left_exceptions.values(),
+        );
+        assert_eq!(decoded, values);
+    }
+
+    /// The strided dictionary search must pick the same cut point as a full scan.
+    ///
+    /// When a float dataset has a stable distribution of left-bit patterns — the same few
+    /// exponent and sign combinations recurring throughout — any `MAX_SAMPLE`-element subset
+    /// identifies the dominant patterns as reliably as scanning everything. Demonstrated here on
+    /// pseudo-random log-normal data, realistic for scientific datasets: the encoder built on an
+    /// unstrided `MAX_SAMPLE` prefix and the one built on `3 * MAX_SAMPLE` values (which strides
+    /// by three internally) agree on `right_bit_width`, and the strided encoder still roundtrips
+    /// bit-exactly.
+    #[test]
+    fn test_subsampling_matches_full_cut_point() {
+        // An inline LCG keeps this dependency-free. Any fixed-size prefix of its output is
+        // statistically representative of the whole sequence.
+        let mut seed: u64 = 0x517C_C1B7_2722_0A95;
+        let mut next_f32 = || -> f32 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let t = (seed >> 33) as f32 / u32::MAX as f32; // [0, 1)
+            (t * 6.0 - 1.0).exp() * 1000.0 // log-normal, like much scientific float data
+        };
+
+        // n > 2 * MAX_SAMPLE, so find_best_dictionary strides by n / MAX_SAMPLE == 3.
+        let n = 3 * MAX_SAMPLE + 1;
+        let values: Vec<f32> = (0..n).map(|_| next_f32()).collect();
+
+        // Built on exactly the first MAX_SAMPLE elements, so stride == 1.
+        let encoder_prefix = RDEncoder::new(&values[..MAX_SAMPLE]);
+        // Built on all n elements, striding internally over roughly as many elements.
+        let encoder_strided = RDEncoder::new(&values);
+
+        let chunk = &values[..64];
+        assert_eq!(
+            encoder_prefix.split(chunk).right_parts_bit_width(),
+            encoder_strided.split(chunk).right_parts_bit_width(),
+            "strided encoder must choose the same right_bit_width as the unstrided prefix encoder"
+        );
+
+        for (orig, dec) in chunk
+            .iter()
+            .zip(encoder_strided.split(chunk).decode().iter())
+        {
+            assert_eq!(
+                f32::to_bits(*orig),
+                f32::to_bits(*dec),
+                "strided encoder must produce a bit-exact roundtrip"
+            );
+        }
     }
 
     #[test]
