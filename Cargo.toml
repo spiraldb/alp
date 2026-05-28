@@ -4,7 +4,11 @@ description = "A pure Rust implementation of Adaptive Lossless floating-Point Co
 version = "0.0.1"
 license = "Apache-2.0"
 repository = "https://github.com/spiraldb/alp"
+readme = "README.md"
+keywords = ["alp", "compression", "floating-point", "codec", "lossless"]
+categories = ["compression"]
 edition = "2021"
+exclude = [".github/*"]
 
 [dependencies]
 fastlanes = "0.5"
