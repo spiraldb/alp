@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 use std::fmt::{Display, Formatter};
-use std::mem::{size_of, transmute, transmute_copy, MaybeUninit};
+use std::mem::{MaybeUninit, size_of, transmute, transmute_copy};
 
 const SAMPLE_SIZE: usize = 32;
 
@@ -718,7 +718,7 @@ mod tests {
         decode_into::<f32>(&encoded, exponents, &mut into);
         assert_eq!(into, original);
 
-        let mut inplace = encoded.clone();
+        let mut inplace = encoded;
         decode_slice_inplace::<f32>(&mut inplace, exponents);
         // SAFETY: `i32` and `f32` have the same layout, and the slice now holds decoded floats.
         let inplace: &[f32] = unsafe { transmute(inplace.as_slice()) };
@@ -777,10 +777,12 @@ mod tests {
         assert_eq!(into_exponents, exponents);
         assert_eq!(into_encoded, encoded);
         assert_eq!(into_patch_indices, patch_indices);
-        assert!(into_patch_values
-            .iter()
-            .zip(&patch_values)
-            .all(|(a, b)| a.is_eq(*b)));
+        assert!(
+            into_patch_values
+                .iter()
+                .zip(&patch_values)
+                .all(|(a, b)| a.is_eq(*b))
+        );
         assert_eq!(into_chunk_offsets, chunk_offsets);
     }
 
