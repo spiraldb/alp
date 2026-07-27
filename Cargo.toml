@@ -7,8 +7,12 @@ repository = "https://github.com/spiraldb/alp"
 readme = "README.md"
 keywords = ["alp", "compression", "floating-point", "codec", "lossless"]
 categories = ["compression"]
-edition = "2021"
+edition = "2024"
+rust-version = "1.91.0"
 exclude = [".github/*"]
+
+[lints]
+workspace = true
 
 [dependencies]
 fastlanes = "0.5"
@@ -30,7 +34,11 @@ all = { level = "deny", priority = -1 }
 as_ptr_cast_mut = "deny"
 borrow_as_ptr = "deny"
 cargo = { level = "deny", priority = -1 }
-cast_possible_truncation = "deny"
+# Truncating casts are deliberate throughout a bit-level codec. Every site either truncates by
+# design (e.g. `ALPRDFloat::to_u16`) or is provably in range (dictionary codes are < MAX_DICT_SIZE,
+# bit widths are <= 64). The float -> int casts saturate, and out-of-range values are caught by the
+# encoder's round-trip check and stored as exceptions.
+cast_possible_truncation = "allow"
 cognitive_complexity = "deny"
 collection_is_never_read = "deny"
 dbg_macro = "deny"
@@ -39,7 +47,9 @@ derive_partial_eq_without_eq = "deny"
 equatable_if_let = "deny"
 exit = "deny"
 expect_fun_call = "deny"
-expect_used = "deny"
+# Panics on invalid input are part of the public contract here (see the `# Panics` sections), and
+# `expect` carries a better message than the indexing panic it replaces.
+expect_used = "allow"
 fallible_impl_from = "deny"
 get_unwrap = "deny"
 host_endian_bytes = "deny"

@@ -607,8 +607,8 @@ struct ALPRDDictionary {
 #[cfg(test)]
 mod test {
     use crate::{
-        alp_rd_apply_patches, alp_rd_combine_codes_inplace, alp_rd_combine_inplace, alp_rd_decode,
-        alp_rd_dict_decode_inplace, bit_width, RDEncoder, MAX_DICT_SIZE,
+        MAX_DICT_SIZE, RDEncoder, alp_rd_apply_patches, alp_rd_combine_codes_inplace,
+        alp_rd_combine_inplace, alp_rd_decode, alp_rd_dict_decode_inplace, bit_width,
     };
 
     #[test]
@@ -667,10 +667,12 @@ mod test {
             bit_width((encoder.codes().len() - 1) as u64) as usize
         );
         assert_eq!(split.right_parts_bit_width(), encoder.right_bit_width());
-        assert!(split
-            .right_parts()
-            .iter()
-            .all(|v| *v < (1u64 << split.right_parts_bit_width())));
+        assert!(
+            split
+                .right_parts()
+                .iter()
+                .all(|v| *v < (1u64 << split.right_parts_bit_width()))
+        );
     }
 
     #[test]
@@ -718,7 +720,7 @@ mod test {
             encoder.right_bit_width(),
         );
 
-        let mut left = left_parts.clone();
+        let mut left = left_parts;
         alp_rd_dict_decode_inplace(&mut left, encoder.codes());
         let mut slow = right_parts;
         alp_rd_combine_inplace::<f64>(&mut slow, &left, encoder.right_bit_width());

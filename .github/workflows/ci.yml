@@ -16,8 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: ./.github/actions/setup-rust
-
+      - uses: spiraldb/actions/.github/actions/setup-rust@a746510eafaa926484c354541cfc49b2ec06cc63 # 0.18.6
+        with:
+          shared_key: "build"
 
       - name: Rust Build
         run: cargo build --all-features --all-targets
@@ -27,3 +28,20 @@ jobs:
         run: cargo clippy --all-features --all-targets
       - name: Rust Test
         run: cargo test --workspace --all-features
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: spiraldb/actions/.github/actions/setup-rust@a746510eafaa926484c354541cfc49b2ec06cc63 # 0.18.6
+        with:
+          shared_key: "msrv"
+
+      - name: Install cargo-msrv
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
+        with:
+          tool: cargo-msrv@0.19.3
+
+      - name: Verify MSRV
+        run: cargo msrv verify -- cargo check --all-features --all-targets --locked
