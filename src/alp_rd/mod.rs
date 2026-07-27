@@ -57,22 +57,22 @@ pub trait ALPRDFloat: private::Sealed + Float {
 impl ALPRDFloat for f64 {
     type UINT = u64;
 
-    #[inline(always)]
+    #[inline]
     fn from_bits(bits: Self::UINT) -> Self {
         f64::from_bits(bits)
     }
 
-    #[inline(always)]
+    #[inline]
     fn to_bits(value: Self) -> Self::UINT {
         value.to_bits()
     }
 
-    #[inline(always)]
+    #[inline]
     fn to_u16(bits: Self::UINT) -> u16 {
         bits as u16
     }
 
-    #[inline(always)]
+    #[inline]
     fn from_u16(value: u16) -> Self::UINT {
         value as u64
     }
@@ -81,22 +81,22 @@ impl ALPRDFloat for f64 {
 impl ALPRDFloat for f32 {
     type UINT = u32;
 
-    #[inline(always)]
+    #[inline]
     fn from_bits(bits: Self::UINT) -> Self {
         f32::from_bits(bits)
     }
 
-    #[inline(always)]
+    #[inline]
     fn to_bits(value: Self) -> Self::UINT {
         value.to_bits()
     }
 
-    #[inline(always)]
+    #[inline]
     fn to_u16(bits: Self::UINT) -> u16 {
         bits as u16
     }
 
-    #[inline(always)]
+    #[inline]
     fn from_u16(value: u16) -> Self::UINT {
         value as u32
     }

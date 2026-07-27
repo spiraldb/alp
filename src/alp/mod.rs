@@ -113,7 +113,7 @@ pub fn decode_slice_inplace<F: ALPFloat>(encoded: &mut [F::ALPInt], exponents: E
 ///
 /// The returned value might decode to a different value than the one passed in. Use
 /// [`encode_single`] for the checked version.
-#[inline(always)]
+#[inline]
 pub fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F::ALPInt {
     F::encode_single_unchecked(value, exponents)
 }
@@ -409,7 +409,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     fn decode_single(encoded: Self::ALPInt, exponents: Exponents) -> Self {
         Self::from_int(encoded) * Self::F10[exponents.f as usize] * Self::IF10[exponents.e as usize]
     }
@@ -418,7 +418,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     ///
     /// The returned value might decode to a different value than the one passed in. Use
     /// [`Self::encode_single`] for the checked version.
-    #[inline(always)]
+    #[inline]
     fn encode_single_unchecked(value: Self, exponents: Exponents) -> Self::ALPInt {
         (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
             .fast_round()
@@ -546,17 +546,17 @@ impl ALPFloat for f32 {
         0.0000000001, // 10^-10
     ];
 
-    #[inline(always)]
+    #[inline]
     fn as_int(self) -> Self::ALPInt {
         self as _
     }
 
-    #[inline(always)]
+    #[inline]
     fn from_int(n: Self::ALPInt) -> Self {
         n as _
     }
 
-    #[inline(always)]
+    #[inline]
     fn is_eq(self, other: Self) -> bool {
         self.to_bits() == other.to_bits()
     }
@@ -622,17 +622,17 @@ impl ALPFloat for f64 {
         0.00000000000000000000001, // 10^-23
     ];
 
-    #[inline(always)]
+    #[inline]
     fn as_int(self) -> Self::ALPInt {
         self as _
     }
 
-    #[inline(always)]
+    #[inline]
     fn from_int(n: Self::ALPInt) -> Self {
         n as _
     }
 
-    #[inline(always)]
+    #[inline]
     fn is_eq(self, other: Self) -> bool {
         self.to_bits() == other.to_bits()
     }
