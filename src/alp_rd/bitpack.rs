@@ -6,13 +6,13 @@ use fastlanes::BitPacking;
 /// Logically, a `PackedVec<T>` is a vector containing values of type `T`.
 ///
 /// Physically, the values are stored bit-packed down to a given width. They can be individually
-/// accessed by performing single unpacking operation.
+/// accessed by performing a single unpacking operation.
 pub struct PackedVec<T> {
     values: Vec<T>,
     packed_width: usize,
 }
 
-/// Bitpack a slice of primitives down to the given width using the FastLanes layout.
+/// Bitpacks a slice of primitives down to the given width using the FastLanes layout.
 pub(crate) fn fastlanes_pack<T: BitPacking>(array: &[T], bit_width: usize) -> Vec<T> {
     if bit_width == 0 {
         return Vec::new();
@@ -22,11 +22,11 @@ pub(crate) fn fastlanes_pack<T: BitPacking>(array: &[T], bit_width: usize) -> Ve
     let num_chunks = array.len().div_ceil(1024);
     let num_full_chunks = array.len() / 1024;
     let packed_len = 128 * bit_width / size_of::<T>();
-    // packed_len says how many values of size T we're going to include.
-    // 1024 * bit_width / 8 == the number of bytes we're going to get.
-    // then we divide by the size of T to get the number of elements.
+    // `packed_len` says how many values of size T we're going to include:
+    // 1024 * bit_width / 8 is the number of bytes we're going to get, which we then divide by the
+    // size of T to get the number of elements.
 
-    // Allocate a result byte array.
+    // Allocate the result vector.
     let mut output = Vec::<T>::with_capacity(num_chunks * packed_len);
 
     // Loop over all but the last chunk.
@@ -77,7 +77,8 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
     }
 
     // How many fastlanes vectors we will process.
-    // Packed array might not start at 0 when the array is sliced. Offset is guaranteed to be < 1024.
+    // The packed array might not start at 0 when the array is sliced. The offset is guaranteed
+    // to be < 1024.
     let num_chunks = (offset + length).div_ceil(1024);
     let elems_per_chunk = 128 * bit_width / size_of::<T>();
     assert_eq!(
@@ -88,10 +89,11 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
         num_chunks * elems_per_chunk
     );
 
-    // Allocate a result vector.
+    // Allocate the result vector.
     let mut output = Vec::with_capacity(num_chunks * 1024 - offset);
 
-    // Handle first chunk if offset is non 0. We have to decode the chunk and skip first offset elements
+    // Handle the first chunk if the offset is non-zero. We have to decode the chunk and skip the
+    // first `offset` elements.
     let first_full_chunk = if offset != 0 {
         let chunk: &[T] = &packed[0..elems_per_chunk];
         let mut decoded = [T::zero(); 1024];
@@ -112,12 +114,12 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
         }
     });
 
-    // The final chunk may have had padding
+    // The final chunk may have had padding.
     output.truncate(length);
 
-    // For small vectors, the overhead of rounding up is more noticable.
-    // Shrink to fit may or may not reallocate depending on the implementation.
-    // But for very small vectors, the reallocation is cheap enough even if it does happen.
+    // For small vectors, the overhead of rounding up is more noticeable. Shrinking to fit may or
+    // may not reallocate depending on the implementation, but for very small vectors the
+    // reallocation is cheap enough even if it does happen.
     if output.len() < 1024 {
         output.shrink_to_fit();
     }
@@ -132,7 +134,7 @@ pub(crate) fn fastlanes_unpack<T: BitPacking>(
     output
 }
 
-// TODO: add fastlanes_unpack_dict that fuses dictionary lookup with unpacking.
+// TODO: add a `fastlanes_unpack_dict` that fuses dictionary lookup with unpacking.
 
 #[cfg(test)]
 mod test {
