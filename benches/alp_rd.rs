@@ -3,12 +3,17 @@
 //! Two things are worth guarding here.
 //!
 //! `RDEncoder::new` rescans the whole sample for every candidate cut point, so its cost currently
-//! scales with the length of the sample. The `encoder_new` group sweeps sample sizes from tiny to
-//! several million so that a change which caps that work — by subsampling, say — shows up as the
-//! curve flattening. The small sizes matter as much as the large ones: an implementation that pays
-//! a fixed cost per cut point, such as clearing or scanning a 64K-entry table, looks fine on
+//! scales with the length of the sample. The `encoder_new` group sweeps sample sizes so that a
+//! change which caps that work — by subsampling, say — shows up as the curve flattening. 16K is the
+//! top size because it is the smallest that makes the flattening decisive; larger inputs only
+//! restate the same slope at several times the runtime under instrumentation. The small sizes
+//! matter just as much, since an implementation paying a fixed cost per cut point looks fine on
 //! millions of values and is an order of magnitude slower on the few thousand a caller typically
 //! samples.
+//!
+//! Keep each case under 1ms as CodSpeed reports it. Everything here is comfortably inside that once
+//! the sample is capped; the sizes above the cap are the exception, and only until the cap lands —
+//! that overage is the cost being measured.
 //!
 //! `RDEncoder::split` runs once per chunk over the whole dataset, so `split_chunks` measures it at
 //! the 1024-value chunk size a columnar layout would use.
@@ -67,14 +72,14 @@ fn interleaved(len: usize) -> Vec<f64> {
 fn bench_encoder_new(c: &mut Criterion) {
     let mut group = c.benchmark_group("encoder_new");
 
-    for len in [64usize, 1_024, 4_096, 65_536, 1 << 20, 1 << 22] {
+    for len in [64usize, 1_024, 4_096, 16_384] {
         let values = log_normal(len);
         group.bench_with_input(BenchmarkId::new("log_normal", len), &values, |b, values| {
             b.iter(|| RDEncoder::new(black_box(values.as_slice())));
         });
     }
 
-    for len in [64usize, 1_024, 65_536, 1 << 20] {
+    for len in [64usize, 1_024, 16_384] {
         let values = narrow_range(len);
         group.bench_with_input(
             BenchmarkId::new("narrow_range", len),
@@ -83,22 +88,23 @@ fn bench_encoder_new(c: &mut Criterion) {
         );
     }
 
-    for len in [65_536usize, 1 << 20] {
-        let values = interleaved(len);
-        group.bench_with_input(
-            BenchmarkId::new("interleaved", len),
-            &values,
-            |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
-        );
-    }
+    let values = interleaved(16_384);
+    group.bench_with_input(
+        BenchmarkId::new("interleaved", 16_384),
+        &values,
+        |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
+    );
 
     group.finish();
 }
 
-/// `split` over the whole dataset in the chunk size a columnar layout would use.
+/// `split` over a run of chunks at the 1024-value chunk size a columnar layout would use.
+///
+/// 32 chunks, not the whole column: `split` is a linear per-chunk pass, so a longer run restates
+/// the same per-value cost while multiplying the measured time under instrumentation.
 fn bench_split_chunks(c: &mut Criterion) {
     const CHUNK: usize = 1024;
-    const LEN: usize = 1 << 20;
+    const LEN: usize = 32 * CHUNK;
 
     let mut group = c.benchmark_group("split_chunks");
     group.throughput(Throughput::Elements(LEN as u64));
@@ -122,7 +128,7 @@ fn bench_split_chunks(c: &mut Criterion) {
 
 /// Decoding, split across the unpatched fast path and the patched one.
 fn bench_decode(c: &mut Criterion) {
-    const LEN: usize = 1 << 20;
+    const LEN: usize = 1 << 15;
 
     let mut group = c.benchmark_group("decode");
     group.throughput(Throughput::Elements(LEN as u64));
