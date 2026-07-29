@@ -14,6 +14,10 @@ exclude = [".github/*"]
 [lints]
 workspace = true
 
+[[bench]]
+name = "alp_rd"
+harness = false
+
 [dependencies]
 fastlanes = "0.5"
 itertools = "0.15.0"
@@ -71,3 +75,8 @@ tests_outside_test_module = "deny"
 unwrap_in_result = "deny"
 unwrap_used = "deny"
 use_debug = "deny"
+
+[dev-dependencies]
+criterion = { package = "codspeed-criterion-compat", version = "5.0.1", default-features = false, features = [
+  "cargo_bench_support",
+] }
