@@ -54,6 +54,7 @@ jobs:
         with:
           run: cargo codspeed run
           token: ${{ secrets.CODSPEED_TOKEN }}
+          mode: "simulation"
 
   msrv:
     name: MSRV
