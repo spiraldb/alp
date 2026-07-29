@@ -3,8 +3,6 @@ mod bitpack;
 use crate::Exceptions;
 use fastlanes::BitPacking;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
-use rustc_hash::FxHashMap;
-use std::cmp::Reverse;
 use std::marker::PhantomData;
 use std::ops::{Range, Shl, Shr};
 
@@ -24,18 +22,11 @@ pub const CUT_LIMIT: usize = 16;
 /// Maximum number of entries in the left-parts dictionary.
 pub const MAX_DICT_SIZE: u8 = 8;
 
-/// Number of distinct left-part bit patterns, i.e. `2^CUT_LIMIT`.
-///
-/// Every candidate cut point keeps at most [`CUT_LIMIT`] bits, so a left part always fits in a
-/// `u16` and can be used directly as an index into a table of this size.
-const LEFT_PARTS_CARDINALITY: usize = 1 << CUT_LIMIT;
-
 /// Target number of values examined when searching for the best cut point.
 ///
-/// Dictionary search evaluates all [`CUT_LIMIT`] candidate cut points, so its cost is proportional
-/// to `CUT_LIMIT * sample_size`. Capping the sample makes [`RDEncoder::new`] cost roughly the same
-/// for a million values as for a few thousand: the dominant left-bit patterns of a column follow
-/// from its exponent distribution, which a few thousand values already characterise.
+/// Dictionary search costs a pass over the sample, so capping it makes [`RDEncoder::new`] cost
+/// roughly the same for a million values as for a few thousand: the dominant left-bit patterns of a
+/// column follow from its exponent distribution, which a few thousand values already characterise.
 ///
 /// Patterns the search never sees are not lost — they simply become exceptions in
 /// [`RDEncoder::split`], at a cost the size estimate already accounts for.
@@ -153,13 +144,115 @@ impl ALPRDFloat for f32 {
 pub struct RDEncoder {
     right_bit_width: u8,
     codes: Vec<u16>,
-    /// Reverse of `codes`: indexed by a left-part bit pattern, holding that pattern's code plus
-    /// one, or zero when the pattern is not in the dictionary.
+    /// Reverse of `codes`, mapping a left-part bit pattern back to its code.
+    reverse: ReverseDict,
+}
+
+/// Number of slots in a [`ReverseDict::Window`] table.
+///
+/// A power of two, so the index is a mask. Wide enough that a window separating the dictionary is
+/// almost always found, and narrow enough that the table stays a couple of cache lines.
+const REVERSE_SLOTS: usize = 32;
+
+/// One bit per 16-bit lane of a [`ReverseDict::Lanes`] word, in the lane's low bit.
+const LANE_ONES: u128 = 0x0001_0001_0001_0001_0001_0001_0001_0001;
+
+/// One bit per 16-bit lane of a [`ReverseDict::Lanes`] word, in the lane's high bit.
+const LANE_HIGH_BITS: u128 = 0x8000_8000_8000_8000_8000_8000_8000_8000;
+
+/// Reverse of an ALP-RD dictionary: left-part bit pattern to dictionary code.
+///
+/// A dictionary holds at most [`MAX_DICT_SIZE`] patterns, but they are drawn from the whole 16-bit
+/// space, so a map indexed by the pattern itself would need a 64 KiB table — more expensive to
+/// allocate and zero than the entire cut-point search costs for a typical sample. Both variants here
+/// fit in a couple of cache lines and cost a handful of instructions to build.
+///
+/// Neither is approximate: a pattern the dictionary does not hold always reports a miss.
+enum ReverseDict {
+    /// `slots[(pattern >> shift) & (REVERSE_SLOTS - 1)]` holds a `(pattern, code)` pair. A slot
+    /// whose pattern equals the one being looked up is a hit; anything else is a miss.
     ///
-    /// The bias by one lets a single byte carry both the code and its presence, keeping the table
-    /// at 64 KiB. Built once per encoder so that [`Self::split_parts`] needs one indexed load per
-    /// value instead of a scan over `codes`.
-    lookup: Box<[u8; LEFT_PARTS_CARDINALITY]>,
+    /// Indexing on a window of the pattern rather than the whole of it is what keeps the table
+    /// small, and storing each pattern next to its code is what keeps it exact — a pattern that
+    /// shares a window with a dictionary entry still fails the comparison. The window is chosen so
+    /// that no two dictionary entries claim the same slot; unused slots hold the first entry, which
+    /// cannot be mistaken for a hit, since the only pattern equal to it indexes its own slot.
+    Window {
+        slots: [(u16, u16); REVERSE_SLOTS],
+        shift: u8,
+    },
+    /// The dictionary patterns as eight 16-bit lanes of a single word, compared all at once.
+    ///
+    /// The fallback for the dictionaries no window separates, which needs no search to build and
+    /// costs a few more instructions per value than [`ReverseDict::Window`]. Lanes past the
+    /// dictionary's length repeat its first entry, which is harmless: a lane can only match the
+    /// pattern it holds, and the lowest matching lane wins.
+    Lanes(u128),
+}
+
+impl ReverseDict {
+    /// Builds the reverse of `codes`, preferring a window that separates its patterns.
+    fn new(codes: &[u16]) -> Self {
+        let Some(&first) = codes.first() else {
+            return Self::Lanes(0);
+        };
+
+        // Shifts past `16 - log2(REVERSE_SLOTS)` keep fewer bits than the table has slots, so they
+        // can only separate patterns a narrower shift already did.
+        for shift in 0..=(16 - REVERSE_SLOTS.ilog2()) as u8 {
+            let mut slots = [(first, 0u16); REVERSE_SLOTS];
+            let mut occupied = [false; REVERSE_SLOTS];
+            let separated = codes.iter().enumerate().all(|(code, &pattern)| {
+                let slot = Self::index(pattern, shift);
+                // A repeated pattern keeps the lowest code, matching a first-match-wins scan.
+                let free = !occupied[slot] || slots[slot].0 == pattern;
+                if !occupied[slot] {
+                    occupied[slot] = true;
+                    slots[slot] = (pattern, code as u16);
+                }
+                free
+            });
+            if separated {
+                return Self::Window { slots, shift };
+            }
+        }
+
+        let mut lanes = [first; MAX_DICT_SIZE as usize];
+        lanes[..codes.len()].copy_from_slice(codes);
+        Self::Lanes(
+            lanes
+                .iter()
+                .rev()
+                .fold(0u128, |word, &pattern| (word << 16) | u128::from(pattern)),
+        )
+    }
+
+    /// The slot a pattern occupies under a given shift.
+    #[inline]
+    fn index(pattern: u16, shift: u8) -> usize {
+        ((pattern >> shift) as usize) & (REVERSE_SLOTS - 1)
+    }
+}
+
+/// The code a [`ReverseDict::Window`] gives `pattern`, or `None` when it holds no such pattern.
+#[inline]
+fn window_code(slots: &[(u16, u16); REVERSE_SLOTS], shift: u8, pattern: u16) -> Option<u16> {
+    let (stored, code) = slots[ReverseDict::index(pattern, shift)];
+    (stored == pattern).then_some(code)
+}
+
+/// The code a [`ReverseDict::Lanes`] word gives `pattern`, or `None` when no lane holds it.
+#[inline]
+fn lanes_code(lanes: u128, pattern: u16) -> Option<u16> {
+    // Multiplying by a one-per-lane word copies the pattern into every lane, so one xor compares it
+    // against the whole dictionary: a lane is zero exactly where it matches.
+    let diff = u128::from(pattern).wrapping_mul(LANE_ONES) ^ lanes;
+
+    // Borrow-propagating subtraction flags every zero lane, and can additionally flag a lane holding
+    // one directly above a zero lane. Both sit above a genuine match, so the lowest flagged lane is
+    // always a real one.
+    let matches = diff.wrapping_sub(LANE_ONES) & !diff & LANE_HIGH_BITS;
+    (matches != 0).then(|| (matches.trailing_zeros() / 16) as u16)
 }
 
 /// The "cut" ALP-RD vector.
@@ -279,13 +372,7 @@ impl RDEncoder {
         let plan = SamplePlan::subsample(sample.len(), MAX_SAMPLE, SAMPLE_BLOCK);
         let dictionary = find_best_dictionary::<T>(sample, &plan);
 
-        let mut codes = vec![0; dictionary.dictionary.len()];
-        dictionary.dictionary.into_iter().for_each(|(bits, code)| {
-            // Write the reverse mapping into the codes vector.
-            codes[code as usize] = bits
-        });
-
-        Self::from_parts(dictionary.right_bit_width, codes)
+        Self::from_parts(dictionary.right_bit_width, dictionary.patterns().to_vec())
     }
 
     /// Builds a new encoder from known parameters.
@@ -301,22 +388,12 @@ impl RDEncoder {
             "ALP-RD dictionary must hold at most MAX_DICT_SIZE entries"
         );
 
-        let mut lookup: Box<[u8; LEFT_PARTS_CARDINALITY]> = vec![0u8; LEFT_PARTS_CARDINALITY]
-            .into_boxed_slice()
-            .try_into()
-            .expect("lookup is allocated with exactly LEFT_PARTS_CARDINALITY entries");
-        for (code, &bits) in codes.iter().enumerate() {
-            // Keep the lowest code for a repeated pattern, matching a first-match-wins scan.
-            let slot = &mut lookup[bits as usize];
-            if *slot == 0 {
-                *slot = code as u8 + 1;
-            }
-        }
+        let reverse = ReverseDict::new(&codes);
 
         Self {
             right_bit_width,
             codes,
-            lookup,
+            reverse,
         }
     }
 
@@ -379,6 +456,29 @@ impl RDEncoder {
             "codes lookup table must be populated before RD encoding"
         );
 
+        // Resolving the reverse dictionary out here specialises the hot loop for the one this
+        // encoder holds, rather than re-testing that for every value.
+        match &self.reverse {
+            ReverseDict::Window { slots, shift } => {
+                self.split_parts_with(doubles, |pattern| window_code(slots, *shift, pattern))
+            }
+            ReverseDict::Lanes(lanes) => {
+                self.split_parts_with(doubles, |pattern| lanes_code(*lanes, pattern))
+            }
+        }
+    }
+
+    /// [`Self::split_parts`], with the reverse dictionary already resolved to a single lookup.
+    #[inline(always)]
+    fn split_parts_with<T, L>(
+        &self,
+        doubles: &[T],
+        lookup: L,
+    ) -> (Vec<u16>, Vec<T::UINT>, Vec<u64>, Vec<u16>)
+    where
+        T: ALPRDFloat,
+        L: Fn(u16) -> Option<u16>,
+    {
         let mut left_parts: Vec<u16> = Vec::with_capacity(doubles.len());
         let mut right_parts: Vec<T::UINT> = Vec::with_capacity(doubles.len());
         let mut exception_pos: Vec<u64> = Vec::with_capacity(doubles.len() / 4);
@@ -388,20 +488,20 @@ impl RDEncoder {
         let right_mask = T::UINT::one().shl(self.right_bit_width as _) - T::UINT::one();
 
         // Cut each value in two and dict-encode its left part in the same pass, keeping track of
-        // exceptions. The dictionary lookup is one indexed load into `self.lookup`.
+        // exceptions.
         for (idx, v) in doubles.iter().copied().enumerate() {
             let bits = T::to_bits(v);
             right_parts.push(bits & right_mask);
 
             let pattern = <T as ALPRDFloat>::to_u16(bits.shr(self.right_bit_width as _));
-            let biased_code = self.lookup[pattern as usize];
-            if biased_code != 0 {
-                left_parts.push(u16::from(biased_code - 1));
-            } else {
-                // Exceptions hold a code of zero and carry their true pattern out-of-band.
-                exception_values.push(pattern);
-                exception_pos.push(idx as u64);
-                left_parts.push(0);
+            match lookup(pattern) {
+                Some(code) => left_parts.push(code),
+                None => {
+                    // Exceptions hold a code of zero and carry their true pattern out-of-band.
+                    exception_values.push(pattern);
+                    exception_pos.push(idx as u64);
+                    left_parts.push(0);
+                }
             }
         }
 
@@ -636,151 +736,176 @@ impl SamplePlan {
     }
 }
 
-/// Buffers reused by [`build_left_parts_dictionary`] across every candidate cut point.
-///
-/// `counts` is direct-addressed by the 16-bit left part, so counting is one indexed increment per
-/// value with no hashing and no collisions. The catch is that a 64K-entry table is far larger than
-/// a typical sample, so clearing it or scanning it for non-zero entries would swamp the counting
-/// itself — sixteen times over, once per trial. `touched` avoids that by recording which entries
-/// were written, which bounds both the reset and the collection by the number of distinct patterns
-/// actually seen.
-struct DictSearchScratch {
-    /// Occurrences of each left-part pattern, indexed by the pattern itself.
-    ///
-    /// Zero everywhere except at the patterns listed in `touched`.
-    counts: Box<[u32; LEFT_PARTS_CARDINALITY]>,
-    /// The patterns holding a non-zero entry in `counts`, in first-seen order.
-    touched: Vec<u16>,
-    /// `(pattern, count)` pairs for the current trial, heaviest hitters first.
-    sorted: Vec<(u16, u32)>,
-}
-
-impl DictSearchScratch {
-    fn new() -> Self {
-        // Allocated as a Vec so the 256 KiB table is never a stack temporary.
-        let counts: Box<[u32; LEFT_PARTS_CARDINALITY]> = vec![0u32; LEFT_PARTS_CARDINALITY]
-            .into_boxed_slice()
-            .try_into()
-            .expect("counts is allocated with exactly LEFT_PARTS_CARDINALITY entries");
-
-        Self {
-            counts,
-            touched: Vec::new(),
-            sorted: Vec::new(),
-        }
-    }
-}
-
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
 /// estimated compressed size, considering only the elements `plan` selects.
+///
+/// The [`CUT_LIMIT`] candidate cut points are all nested: cutting after `p` bits groups values by
+/// their leading `p` bits, and each of those groups is the union of two groups of the cut one bit
+/// deeper. So the search reads the sample once, at the deepest cut, and then walks outwards by
+/// merging pairs of adjacent groups — after which every remaining candidate costs a pass over the
+/// distinct patterns rather than over the sample.
 fn find_best_dictionary<T: ALPRDFloat>(samples: &[T], plan: &SamplePlan) -> ALPRDDictionary {
+    // Group counts at the deepest cut point, ascending by pattern, which is what lets the merge
+    // below combine each pair of sibling groups by looking only at its neighbour.
+    let mut patterns = gather_patterns::<T>(samples, plan);
+    radix_sort_u16(&mut patterns);
+    let mut groups = run_length_encode(&patterns);
+
     let mut best_est_size = f64::MAX;
     let mut best_dict = ALPRDDictionary::default();
-    let mut scratch = DictSearchScratch::new();
-
-    for p in 1..=CUT_LIMIT {
-        let candidate_right_bw = (T::BITS - p) as u8;
-        let (dictionary, exception_count) = build_left_parts_dictionary::<T>(
-            samples,
-            plan,
-            candidate_right_bw,
-            MAX_DICT_SIZE,
-            &mut scratch,
-        );
+    for p in (1..=CUT_LIMIT).rev() {
+        let dictionary = select_dictionary((T::BITS - p) as u8, &groups);
         let estimated_size = estimate_compression_size(
             dictionary.right_bit_width,
             dictionary.left_bit_width,
-            exception_count,
-            // Per sampled element, not per input element, so that the exception term stays on the
-            // same scale as the counts it came from.
+            // Values whose pattern missed the dictionary. Per sampled element, not per input
+            // element, so that the term stays on the same scale as the counts it came from.
+            plan.count() - dictionary.encodable,
             plan.count(),
         );
-        if estimated_size < best_est_size {
+        // Cut points are visited deepest-first, so accepting ties leaves the shallowest of the
+        // equally-good cuts holding the title, as a search running the other way would.
+        if estimated_size <= best_est_size {
             best_est_size = estimated_size;
             best_dict = dictionary;
         }
+
+        // Step out one bit, dropping the low bit of every pattern.
+        merge_sibling_groups(&mut groups);
     }
 
     best_dict
 }
 
-/// Builds a dictionary of the leftmost bits.
+/// Collects the leading [`CUT_LIMIT`] bits of every value the plan selects.
 ///
-/// `scratch` must arrive with an all-zero `counts` and an empty `touched`, and is left that way.
-fn build_left_parts_dictionary<T: ALPRDFloat>(
-    samples: &[T],
-    plan: &SamplePlan,
-    right_bw: u8,
-    max_dict_size: u8,
-    scratch: &mut DictSearchScratch,
-) -> (ALPRDDictionary, usize) {
-    assert!(
-        right_bw >= (T::BITS - CUT_LIMIT) as _,
-        "left-parts must be <= 16 bits"
-    );
-
-    let DictSearchScratch {
-        counts,
-        touched,
-        sorted,
-    } = scratch;
-    debug_assert!(
-        touched.is_empty(),
-        "counts was left dirty by the previous trial"
-    );
-
-    // Count the number of occurrences of each left bit pattern. The pattern is a u16, so it indexes
-    // `counts` directly.
+/// Patterns at shallower cut points are prefixes of these, so one pass over the sample serves every
+/// candidate cut point.
+fn gather_patterns<T: ALPRDFloat>(samples: &[T], plan: &SamplePlan) -> Vec<u16> {
+    let shift = (T::BITS - CUT_LIMIT) as u32;
+    let mut patterns = Vec::with_capacity(plan.count());
     for range in plan.ranges() {
-        for value in &samples[range.start..range.end] {
-            let pattern = <T as ALPRDFloat>::to_u16(T::to_bits(*value).shr(right_bw as _));
-            let count = &mut counts[pattern as usize];
-            if *count == 0 {
-                touched.push(pattern);
-            }
-            *count += 1;
+        patterns.extend(
+            samples[range.start..range.end]
+                .iter()
+                .map(|value| <T as ALPRDFloat>::to_u16(T::to_bits(*value).shr(shift as _))),
+        );
+    }
+    patterns
+}
+
+/// Sorts 16-bit keys with a two-digit least-significant-digit radix sort.
+///
+/// Counting the keys of a sample directly into a table indexed by the key would need 256 KiB, more
+/// than a typical sample is long; a comparison sort of the same keys costs several times this. Both
+/// digit passes are sequential reads and writes over the sample and a 1 KiB histogram.
+fn radix_sort_u16(values: &mut Vec<u16>) {
+    const DIGIT_BITS: u32 = 8;
+    const DIGITS: usize = 1 << DIGIT_BITS;
+
+    let mut scratch: Vec<u16> = Vec::with_capacity(values.len());
+    for shift in [0, DIGIT_BITS] {
+        let mut offsets = [0u32; DIGITS];
+        for &value in values.iter() {
+            offsets[((value >> shift) as usize) & (DIGITS - 1)] += 1;
+        }
+
+        // A digit the whole sample agrees on cannot reorder anything, and skipping its scatter is
+        // most of the sort for the low-cardinality data ALP-RD is aimed at.
+        if offsets.iter().any(|&count| count as usize == values.len()) {
+            continue;
+        }
+
+        let mut start = 0;
+        for offset in offsets.iter_mut() {
+            let count = *offset;
+            *offset = start;
+            start += count;
+        }
+
+        scratch.clear();
+        scratch.resize(values.len(), 0);
+        for &value in values.iter() {
+            let digit = ((value >> shift) as usize) & (DIGITS - 1);
+            scratch[offsets[digit] as usize] = value;
+            offsets[digit] += 1;
+        }
+        std::mem::swap(values, &mut scratch);
+    }
+}
+
+/// Counts the runs of equal patterns in a sorted slice, as `(pattern, count)` ascending.
+fn run_length_encode(sorted: &[u16]) -> Vec<(u16, u32)> {
+    let mut groups: Vec<(u16, u32)> = Vec::new();
+    for &pattern in sorted {
+        match groups.last_mut() {
+            Some((last, count)) if *last == pattern => *count += 1,
+            _ => groups.push((pattern, 1)),
         }
     }
+    groups
+}
 
-    // Sorted counts: heavy hitters first, ties broken on the pattern so that the dictionary — and
-    // so the encoded output — is reproducible rather than left to the sort's internals.
-    sorted.clear();
-    sorted.extend(
-        touched
-            .iter()
-            .map(|&pattern| (pattern, counts[pattern as usize])),
-    );
-    sorted.sort_unstable_by_key(|&(pattern, count)| (Reverse(count), pattern));
+/// Rewrites groups of patterns as groups of patterns one bit shorter, summing the pairs of groups
+/// that share the shorter pattern.
+///
+/// Input and output are both ascending by pattern, so the pair of groups that merge are always
+/// adjacent and the rewrite is a single pass that never outruns itself.
+fn merge_sibling_groups(groups: &mut Vec<(u16, u32)>) {
+    let mut merged = 0;
+    let mut read = 0;
+    while read < groups.len() {
+        let (pattern, mut count) = groups[read];
+        let pattern = pattern >> 1;
+        read += 1;
+        if let Some(&(sibling, sibling_count)) = groups.get(read)
+            && sibling >> 1 == pattern
+        {
+            count += sibling_count;
+            read += 1;
+        }
+        groups[merged] = (pattern, count);
+        merged += 1;
+    }
+    groups.truncate(merged);
+}
 
-    // Assign the most-frequently occurring left-bits as dictionary codes, up to `max_dict_size`...
-    let dict_len = (max_dict_size as usize).min(sorted.len());
-    let mut dictionary = FxHashMap::with_capacity_and_hasher(dict_len, Default::default());
-    for (code, &(bits, _)) in sorted[..dict_len].iter().enumerate() {
-        dictionary.insert(bits, code as u16);
+/// Picks the [`MAX_DICT_SIZE`] most common patterns as the dictionary for a cut point.
+///
+/// `groups` must be the pattern counts at that cut point, ascending by pattern.
+fn select_dictionary(right_bw: u8, groups: &[(u16, u32)]) -> ALPRDDictionary {
+    let mut patterns = [0u16; MAX_DICT_SIZE as usize];
+    let mut counts = [0u32; MAX_DICT_SIZE as usize];
+    let mut len = 0usize;
+
+    for &(pattern, count) in groups {
+        // Groups arrive ascending by pattern, so a group tying with one already held belongs after
+        // it: inserting only ahead of strictly smaller counts keeps the dictionary — and so the
+        // encoded output — decided by the data rather than by chance.
+        let Some(at) = counts[..len].iter().position(|&held| count > held) else {
+            if len < patterns.len() {
+                patterns[len] = pattern;
+                counts[len] = count;
+                len += 1;
+            }
+            continue;
+        };
+
+        len = (len + 1).min(patterns.len());
+        patterns[at..len].rotate_right(1);
+        counts[at..len].rotate_right(1);
+        patterns[at] = pattern;
+        counts[at] = count;
     }
 
-    // ...and the rest are exceptions.
-    let exception_count: usize = sorted[dict_len..]
-        .iter()
-        .map(|&(_, count)| count as usize)
-        .sum();
-
-    // Left bit-width is determined based on the actual dictionary size.
-    let left_bw = bit_width(dictionary.len().saturating_sub(1) as u64);
-
-    // Restore the all-zero invariant, touching only the entries this trial wrote.
-    for pattern in touched.drain(..) {
-        counts[pattern as usize] = 0;
+    ALPRDDictionary {
+        patterns,
+        len: len as u8,
+        // The left bit-width follows from the number of codes the dictionary actually holds.
+        left_bit_width: bit_width(len.saturating_sub(1) as u64),
+        right_bit_width: right_bw,
+        encodable: counts[..len].iter().map(|&count| count as usize).sum(),
     }
-
-    (
-        ALPRDDictionary {
-            dictionary,
-            right_bit_width: right_bw,
-            left_bit_width: left_bw,
-        },
-        exception_count,
-    )
 }
 
 /// Estimates the bits-per-value when using these compression settings.
@@ -800,21 +925,39 @@ fn estimate_compression_size(
 /// The ALP-RD dictionary, encoding the "left parts" and their dictionary encoding.
 #[derive(Debug, Default)]
 struct ALPRDDictionary {
-    /// Items in the dictionary are bit patterns, along with their 16-bit encoding.
-    dictionary: FxHashMap<u16, u16>,
+    /// The left-part bit patterns of the dictionary, indexed by the code that encodes them, of
+    /// which `len` are live.
+    patterns: [u16; MAX_DICT_SIZE as usize],
+    /// Number of live entries in `patterns`.
+    len: u8,
     /// The (compressed) left bit-width. This is after bit-packing the dictionary codes.
     left_bit_width: u8,
     /// The right bit-width. This is the bit-packed width of each of the "real double" values.
     right_bit_width: u8,
+    /// How many of the counted values hold a pattern this dictionary encodes. The rest are
+    /// exceptions.
+    encodable: usize,
+}
+
+impl ALPRDDictionary {
+    /// The live left-part patterns, indexed by their code.
+    fn patterns(&self) -> &[u16] {
+        &self.patterns[..self.len as usize]
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::{MAX_SAMPLE, SAMPLE_BLOCK, SamplePlan, find_best_dictionary};
+    use super::{
+        ALPRDFloat, CUT_LIMIT, MAX_SAMPLE, REVERSE_SLOTS, ReverseDict, SAMPLE_BLOCK, SamplePlan,
+        estimate_compression_size, find_best_dictionary, lanes_code, window_code,
+    };
     use crate::{
         MAX_DICT_SIZE, RDEncoder, alp_rd_apply_patches, alp_rd_combine_codes_inplace,
         alp_rd_combine_inplace, alp_rd_decode, alp_rd_dict_decode_inplace, bit_width,
     };
+    use std::cmp::Reverse;
+    use std::collections::HashMap;
 
     /// A small linear congruential generator, so the tests need no extra dependencies.
     struct Lcg(u64);
@@ -824,12 +967,16 @@ mod test {
             Self(0x517C_C1B7_2722_0A95)
         }
 
-        fn next_unit(&mut self) -> f64 {
+        fn next_bits(&mut self) -> u64 {
             self.0 = self
                 .0
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+            self.0
+        }
+
+        fn next_unit(&mut self) -> f64 {
+            (self.next_bits() >> 11) as f64 / (1u64 << 53) as f64
         }
 
         /// A log-normal-ish draw, spanning enough exponents to look like real scientific data.
@@ -857,7 +1004,7 @@ mod test {
         // Position plus value, matching `estimate_compression_size`.
         const EXCEPTION_BITS: f64 = 32.0;
 
-        let mut counts = std::collections::HashMap::new();
+        let mut counts = HashMap::new();
         for value in values {
             *counts
                 .entry((value.to_bits() >> right_bw) as u16)
@@ -886,6 +1033,198 @@ mod test {
             cut_point_cost(values, subsampled),
             cut_point_cost(values, full),
         )
+    }
+
+    /// The cut-point search, written the obvious way: count the left parts at every candidate cut
+    /// point, score each, keep the cheapest. [`find_best_dictionary`] rearranges this into a single
+    /// pass over the sample and must land on exactly the same dictionary.
+    fn reference_best_dictionary<T: ALPRDFloat>(
+        samples: &[T],
+        plan: &SamplePlan,
+    ) -> (u8, Vec<u16>) {
+        let mut best: Option<(f64, u8, Vec<u16>)> = None;
+
+        for p in 1..=CUT_LIMIT {
+            let right_bw = (T::BITS - p) as u8;
+            let mut counts: HashMap<u16, usize> = HashMap::new();
+            for range in plan.ranges() {
+                for value in &samples[range.start..range.end] {
+                    let pattern =
+                        <T as ALPRDFloat>::to_u16(T::to_bits(*value) >> right_bw as usize);
+                    *counts.entry(pattern).or_default() += 1;
+                }
+            }
+
+            let mut sorted: Vec<(u16, usize)> = counts.into_iter().collect();
+            sorted.sort_unstable_by_key(|&(pattern, count)| (Reverse(count), pattern));
+            let dict_len = (MAX_DICT_SIZE as usize).min(sorted.len());
+            let exceptions: usize = sorted[dict_len..].iter().map(|&(_, count)| count).sum();
+            let estimate = estimate_compression_size(
+                right_bw,
+                bit_width(dict_len.saturating_sub(1) as u64),
+                exceptions,
+                plan.count(),
+            );
+
+            if best
+                .as_ref()
+                .is_none_or(|&(previous, _, _)| estimate < previous)
+            {
+                let codes = sorted[..dict_len].iter().map(|&(bits, _)| bits).collect();
+                best = Some((estimate, right_bw, codes));
+            }
+        }
+
+        let (_, right_bw, codes) = best.expect("the search always considers a cut point");
+        (right_bw, codes)
+    }
+
+    /// Values shaped the ways that pull the search in different directions.
+    fn distributions(len: usize) -> Vec<(&'static str, Vec<f64>)> {
+        let mut rng = Lcg::new();
+        let log_normal = (0..len).map(|_| rng.next_log_normal()).collect();
+        let mut rng = Lcg::new();
+        let narrow = (0..len).map(|_| 1.0 + rng.next_unit()).collect();
+        let mut rng = Lcg::new();
+        // Two magnitudes and both signs, so the left parts split into distant clusters.
+        let bimodal = (0..len)
+            .map(|i| {
+                let magnitude = if i % 3 == 0 { -1e-8 } else { 1e12 };
+                magnitude * (1.0 + rng.next_unit())
+            })
+            .collect();
+        // Every value identical: one pattern, so most cut points score the same and the tie-break
+        // decides the winner.
+        let constant = vec![7.5f64; len];
+        // More distinct patterns than the dictionary can hold at any cut point.
+        let mut rng = Lcg::new();
+        let high_cardinality = (0..len)
+            .map(|_| f64::from_bits(rng.next_bits() & 0x7FEF_FFFF_FFFF_FFFF))
+            .collect();
+
+        vec![
+            ("log_normal", log_normal),
+            ("narrow", narrow),
+            ("bimodal", bimodal),
+            ("constant", constant),
+            ("high_cardinality", high_cardinality),
+        ]
+    }
+
+    #[test]
+    fn test_search_matches_reference_search() {
+        for len in [1usize, 2, 63, 64, 1000, 4 * MAX_SAMPLE + 7] {
+            for (name, values) in distributions(len) {
+                for plan in [
+                    SamplePlan::full(len),
+                    SamplePlan::subsample(len, MAX_SAMPLE, SAMPLE_BLOCK),
+                ] {
+                    let (right_bw, codes) = reference_best_dictionary::<f64>(&values, &plan);
+                    let actual = find_best_dictionary::<f64>(&values, &plan);
+                    assert_eq!(
+                        (actual.right_bit_width, actual.patterns()),
+                        (right_bw, codes.as_slice()),
+                        "{name} at len {len} with {} sampled",
+                        plan.count()
+                    );
+
+                    let floats: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                    let (right_bw, codes) = reference_best_dictionary::<f32>(&floats, &plan);
+                    let actual = find_best_dictionary::<f32>(&floats, &plan);
+                    assert_eq!(
+                        (actual.right_bit_width, actual.patterns()),
+                        (right_bw, codes.as_slice()),
+                        "{name} as f32 at len {len} with {} sampled",
+                        plan.count()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both reverse-dictionary variants must answer for every one of the 65536 possible patterns
+    /// exactly as a scan of the dictionary would.
+    #[test]
+    fn test_reverse_dict_variants_match_a_scan() {
+        let mut rng = Lcg::new();
+        let dictionaries = [
+            vec![0u16],
+            vec![0x3FF0, 0x3FF1, 0x3FF2],
+            // Repeated patterns: the lowest code must win, as in a first-match-wins scan.
+            vec![0x1234, 0x1234, 0x0001],
+            // Defeats every window, so this one exercises the lane fallback.
+            vec![0x0000, 0x8000, 0x0001],
+            (0..MAX_DICT_SIZE as u16).map(|i| i * 0x1111).collect(),
+            (0..MAX_DICT_SIZE).map(|_| rng.next_bits() as u16).collect(),
+        ];
+
+        for codes in dictionaries {
+            let reverse = ReverseDict::new(&codes);
+            for pattern in 0..=u16::MAX {
+                let expected = codes
+                    .iter()
+                    .position(|&bits| bits == pattern)
+                    .map(|code| code as u16);
+                let actual = match &reverse {
+                    ReverseDict::Window { slots, shift } => window_code(slots, *shift, pattern),
+                    ReverseDict::Lanes(lanes) => lanes_code(*lanes, pattern),
+                };
+                assert_eq!(
+                    actual, expected,
+                    "dictionary {codes:x?}, pattern {pattern:#06x}"
+                );
+            }
+        }
+    }
+
+    /// The lane fallback is reachable — patterns differing only in the top bit share every window —
+    /// so encoding must be correct when a dictionary lands on it.
+    #[test]
+    fn test_lane_fallback_round_trips() {
+        let codes = vec![0x0000u16, 0x8000, 0x0001];
+        assert!(
+            matches!(ReverseDict::new(&codes), ReverseDict::Lanes(_)),
+            "expected this dictionary to defeat every window"
+        );
+
+        let right_bw = 48;
+        let encoder = RDEncoder::from_parts(right_bw, codes.clone());
+        // One value per dictionary entry, plus one whose pattern is absent.
+        let values: Vec<f64> = codes
+            .iter()
+            .map(|&bits| f64::from_bits((u64::from(bits) << right_bw) | 0xABC))
+            .chain([f64::from_bits((0x4321u64 << right_bw) | 0xABC)])
+            .collect();
+
+        let split = encoder.split(&values);
+        assert_eq!(split.left_parts(), &[0, 1, 2, 0]);
+        assert_eq!(split.left_exceptions().positions(), &[3]);
+        assert_eq!(split.decode(), values);
+    }
+
+    /// A window table is only exact if no two dictionary entries claim the same slot.
+    #[test]
+    fn test_window_slots_are_unshared() {
+        let mut rng = Lcg::new();
+        for _ in 0..256 {
+            let mut codes: Vec<u16> = (0..MAX_DICT_SIZE).map(|_| rng.next_bits() as u16).collect();
+            // A repeated pattern shares its slot with itself, which is not what this is about.
+            codes.sort_unstable();
+            codes.dedup();
+            let ReverseDict::Window { shift, .. } = ReverseDict::new(&codes) else {
+                continue;
+            };
+
+            let mut claimed = [false; REVERSE_SLOTS];
+            for &pattern in &codes {
+                let slot = ReverseDict::index(pattern, shift);
+                assert!(
+                    !claimed[slot],
+                    "{codes:x?} shares slot {slot} at shift {shift}"
+                );
+                claimed[slot] = true;
+            }
+        }
     }
 
     #[test]
