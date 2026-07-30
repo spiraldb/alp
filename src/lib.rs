@@ -11,12 +11,7 @@
 //! ALP-RD is generally terminal, and in the ideal case it can represent an f64 in just 49 bits,
 //! though generally it is closer to 54 bits per value or ~12.5% compression.
 //!
-//! Either way, the output is one integer per value in a word as wide as the float it came from, and
-//! the bytes are saved by bit-packing those integers down to the width they need — after a frame of
-//! reference, for classic ALP. [The section on bit-packing](#bit-packing) shows which arrays to pack
-//! and at what width; [fastlanes] does the packing itself, and [vortex] cascades the whole thing.
-//!
-//! # Classic ALP
+//! # ALP
 //!
 //! [`encode`] picks the best exponents for the input (unless they are given), and returns the
 //! encoded integers alongside the positions and values of the exceptions that do not round-trip.
@@ -79,6 +74,65 @@
 //! [fastlanes] packs 1024 values at a time, which is also [`ENCODE_CHUNK_SIZE`], so encode and pack
 //! at the same granularity: a chunk at a time. A shorter chunk is padded out to 1024 values, so
 //! packing a handful of values saves nothing.
+//!
+//! ## Bit-packing ALP
+//!
+//! Classic ALP's encoded integers are signed and sit wherever the data does, so packing them starts
+//! with a frame of reference: subtract the minimum, pack the differences, keep the minimum. Patched
+//! slots hold a fill value taken from the data itself, so they do not widen that frame.
+//!
+//! | Component | Where | Count | Pack at |
+//! | --- | --- | --- | --- |
+//! | encoded values | [`encode`]'s 2nd result | one per value | [`bit_width`] of `max - min`, after subtracting `min` |
+//! | patch positions | [`encode`]'s 3rd result | one per exception | as is, or 10 bits for a 1024-value chunk |
+//! | patch values | [`encode`]'s 4th result | one per exception | as is: they are the original floats, at full precision |
+//! | chunk offsets | [`encode`]'s 5th result | one per [`ENCODE_CHUNK_SIZE`] | as is |
+//! | exponents | [`encode`]'s 1st result | two bytes per column | as is |
+//!
+//! ```
+//! # use fastlanes::BitPacking;
+//! # fn pack<T: BitPacking>(chunk: &[T; 1024], width: usize) -> Vec<T> {
+//! #     let mut packed = vec![T::zero(); 1024 * width / (size_of::<T>() * 8)];
+//! #     unsafe { BitPacking::unchecked_pack(width, chunk, &mut packed) };
+//! #     packed
+//! # }
+//! # fn unpack<T: BitPacking>(packed: &[T], width: usize) -> Vec<T> {
+//! #     let mut chunk = vec![T::zero(); 1024];
+//! #     unsafe { BitPacking::unchecked_unpack(width, packed, &mut chunk) };
+//! #     chunk
+//! # }
+//! // Two decimal places, which is what classic ALP is for.
+//! let mut values: Vec<f64> = (0..1024).map(|i| 100.0 + (i % 500) as f64 / 100.0).collect();
+//! values[7] = 1.0 / 3.0; // Does not round-trip, so it becomes a patch.
+//!
+//! let (exponents, encoded, patch_positions, patch_values, _chunk_offsets) =
+//!     alp::encode(&values, None);
+//!
+//! // Frame of reference, then pack the differences.
+//! let min = encoded.iter().copied().min().expect("a non-empty chunk");
+//! let max = encoded.iter().copied().max().expect("a non-empty chunk");
+//! let width = alp::bit_width(max.wrapping_sub(min) as u64) as usize;
+//!
+//! let shifted: Vec<u64> = encoded.iter().map(|v| v.wrapping_sub(min) as u64).collect();
+//! let shifted: [u64; 1024] = shifted.try_into().expect("one full chunk");
+//! let packed = pack(&shifted, width);
+//!
+//! // 1,152 bytes where the input took 8,192, or 9 bits per value: the encoded integers run from
+//! // 10000 to 10499, and the patched slot holds a fill value inside that range.
+//! assert!(size_of_val(packed.as_slice()) < size_of_val(values.as_slice()));
+//!
+//! // Undo the frame, decode, and write the patches over the slots that did not round-trip.
+//! let unshifted: Vec<i64> = unpack(&packed, width)
+//!     .into_iter()
+//!     .map(|v| (v as i64).wrapping_add(min))
+//!     .collect();
+//!
+//! let mut decoded = alp::decode::<f64>(&unshifted, exponents);
+//! for (&position, &value) in patch_positions.iter().zip(&patch_values) {
+//!     decoded[position as usize] = value;
+//! }
+//! assert_eq!(decoded, values);
+//! ```
 //!
 //! ## Bit-packing ALP-RD
 //!
@@ -160,65 +214,6 @@
 //!     f64::from_bits((u64::from(left) << right_width) | right),
 //!     values[position],
 //! );
-//! ```
-//!
-//! ## Bit-packing classic ALP
-//!
-//! Classic ALP's encoded integers are signed and sit wherever the data does, so packing them starts
-//! with a frame of reference: subtract the minimum, pack the differences, keep the minimum. Patched
-//! slots hold a fill value taken from the data itself, so they do not widen that frame.
-//!
-//! | Component | Where | Count | Pack at |
-//! | --- | --- | --- | --- |
-//! | encoded values | [`encode`]'s 2nd result | one per value | [`bit_width`] of `max - min`, after subtracting `min` |
-//! | patch positions | [`encode`]'s 3rd result | one per exception | as is, or 10 bits for a 1024-value chunk |
-//! | patch values | [`encode`]'s 4th result | one per exception | as is: they are the original floats, at full precision |
-//! | chunk offsets | [`encode`]'s 5th result | one per [`ENCODE_CHUNK_SIZE`] | as is |
-//! | exponents | [`encode`]'s 1st result | two bytes per column | as is |
-//!
-//! ```
-//! # use fastlanes::BitPacking;
-//! # fn pack<T: BitPacking>(chunk: &[T; 1024], width: usize) -> Vec<T> {
-//! #     let mut packed = vec![T::zero(); 1024 * width / (size_of::<T>() * 8)];
-//! #     unsafe { BitPacking::unchecked_pack(width, chunk, &mut packed) };
-//! #     packed
-//! # }
-//! # fn unpack<T: BitPacking>(packed: &[T], width: usize) -> Vec<T> {
-//! #     let mut chunk = vec![T::zero(); 1024];
-//! #     unsafe { BitPacking::unchecked_unpack(width, packed, &mut chunk) };
-//! #     chunk
-//! # }
-//! // Two decimal places, which is what classic ALP is for.
-//! let mut values: Vec<f64> = (0..1024).map(|i| 100.0 + (i % 500) as f64 / 100.0).collect();
-//! values[7] = 1.0 / 3.0; // Does not round-trip, so it becomes a patch.
-//!
-//! let (exponents, encoded, patch_positions, patch_values, _chunk_offsets) =
-//!     alp::encode(&values, None);
-//!
-//! // Frame of reference, then pack the differences.
-//! let min = encoded.iter().copied().min().expect("a non-empty chunk");
-//! let max = encoded.iter().copied().max().expect("a non-empty chunk");
-//! let width = alp::bit_width(max.wrapping_sub(min) as u64) as usize;
-//!
-//! let shifted: Vec<u64> = encoded.iter().map(|v| v.wrapping_sub(min) as u64).collect();
-//! let shifted: [u64; 1024] = shifted.try_into().expect("one full chunk");
-//! let packed = pack(&shifted, width);
-//!
-//! // 1,152 bytes where the input took 8,192, or 9 bits per value: the encoded integers run from
-//! // 10000 to 10499, and the patched slot holds a fill value inside that range.
-//! assert!(size_of_val(packed.as_slice()) < size_of_val(values.as_slice()));
-//!
-//! // Undo the frame, decode, and write the patches over the slots that did not round-trip.
-//! let unshifted: Vec<i64> = unpack(&packed, width)
-//!     .into_iter()
-//!     .map(|v| (v as i64).wrapping_add(min))
-//!     .collect();
-//!
-//! let mut decoded = alp::decode::<f64>(&unshifted, exponents);
-//! for (&position, &value) in patch_positions.iter().zip(&patch_values) {
-//!     decoded[position as usize] = value;
-//! }
-//! assert_eq!(decoded, values);
 //! ```
 //!
 //! [paper]: https://ir.cwi.nl/pub/33334/33334.pdf
