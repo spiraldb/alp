@@ -59,10 +59,9 @@ assert_eq!(split.decode(), values);
 
 ## Bit-packing
 
-Neither variant packs bits: both leave you integers narrow enough to pack, which is where the bytes
-are actually saved. The [bit-packing section of the docs][bit-packing] walks through both variants
-end to end — which array to pack, at which width, and how to decode what comes back — using
-[fastlanes], which does the packing. [Vortex] cascades the whole thing, ALP included.
+Result of ALP and ALP-RD requires bitpacking to actually save space by themselves both variants
+only prepare the data for further compression. The [bit-packing section of the docs][bit-packing]
+walks through both variants end to end.
 
 ## Benchmarks
 
