@@ -26,6 +26,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Rust Lint - Clippy
         run: cargo clippy --all-features --all-targets
+      # Rustdoc warnings are denied through the lints table, so this fails on a broken intra-doc
+      # link, which is also what would fail the docs.rs build.
+      - name: Rust Lint - Docs
+        run: cargo doc --all-features --no-deps
       - name: Rust Test
         run: cargo test --workspace --all-features
 

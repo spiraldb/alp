@@ -1,5 +1,3 @@
-mod bitpack;
-
 use crate::Exceptions;
 use fastlanes::BitPacking;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
@@ -352,10 +350,10 @@ where
 impl RDEncoder {
     /// Builds a new encoder from a sample of doubles.
     ///
-    /// Long samples are not read in full: past [`MAX_SAMPLE`] values the search examines evenly
-    /// spread contiguous runs instead (see [`SamplePlan`]), so this call costs about the same for a
-    /// million values as for a few thousand. Values in the unexamined gaps still encode correctly —
-    /// a left-part pattern the search never saw becomes an exception in [`Self::split`].
+    /// Long samples are not read in full: past a few thousand values the search examines evenly
+    /// spread contiguous runs instead, so this call costs about the same for a million values as for
+    /// a few thousand. Values in the unexamined gaps still encode correctly — a left-part pattern
+    /// the search never saw becomes an exception in [`Self::split`].
     ///
     /// # Panics
     ///
@@ -416,6 +414,11 @@ impl RDEncoder {
     }
 
     /// Encodes the floating-point values into a [`Split`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the encoder holds no dictionary entries, which only an empty `codes` passed to
+    /// [`Self::from_parts`] can produce.
     pub fn split<T>(&self, doubles: &[T]) -> Split<T, T::UINT>
     where
         T: ALPRDFloat,
@@ -447,6 +450,11 @@ impl RDEncoder {
     /// The left parts are returned as dictionary codes, packable into
     /// [`Self::left_bit_width`] bits; the right parts are packable into
     /// [`Self::right_bit_width`] bits. Positions of exceptions hold a code of zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the encoder holds no dictionary entries, which only an empty `codes` passed to
+    /// [`Self::from_parts`] can produce.
     pub fn split_parts<T>(&self, doubles: &[T]) -> (Vec<u16>, Vec<T::UINT>, Vec<u64>, Vec<u16>)
     where
         T: ALPRDFloat,
