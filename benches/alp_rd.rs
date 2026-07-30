@@ -15,8 +15,6 @@
 //! `RDEncoder::split` runs once per chunk over the whole dataset, so `split_chunks` measures it at
 //! the 1024-value chunk size a columnar layout would use.
 
-// The crate denies `missing_docs`, but the entry point `criterion_main!` generates is not ours to
-// document.
 #![allow(missing_docs)]
 
 use alp::{RDEncoder, alp_rd_decode};
