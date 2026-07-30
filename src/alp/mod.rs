@@ -134,10 +134,8 @@ fn update_bounds<I: Ord + Copy>(bounds: &mut Option<(I, I)>, value: I) {
 
 /// Main trait for classic-ALP encodable floating-point numbers.
 ///
-/// Like the paper, we limit this to the IEEE 754 single-precision (`f32`) and double-precision
-/// (`f64`) floating-point types. The free functions at the crate root ([`encode`], [`decode`], and
-/// the rest) call through to this, and are usually what you want to reach for; the trait itself is
-/// there for code that is generic over the float type.
+/// We limit this to the IEEE 754 single-precision (`f32`) and double-precision
+/// (`f64`) floating-point types.
 pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// The signed integer type of the same width, which values of this type encode to.
     type ALPInt: PrimInt + Display + ToPrimitive;
