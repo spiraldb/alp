@@ -50,7 +50,7 @@ jobs:
         run: cargo codspeed build --all-features
 
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@6e3823cc2539fc99a552b70a0cde2a5b40ab382a # v4
+        uses: CodSpeedHQ/action@f22792bfac16f3e14eb9fbea76f4a48e9cc22b93 # v4
         with:
           run: cargo codspeed run
           token: ${{ secrets.CODSPEED_TOKEN }}
