@@ -21,16 +21,13 @@ cargo add alp
 
 ## Which variant
 
-| | Classic ALP | ALP-RD |
+| | ALP | ALP-RD |
 | --- | --- | --- |
 | Suits | values with few significant decimal digits: prices, sensor readings, rounded measurements | "real doubles" that use the full mantissa: coordinates, embeddings, physical constants |
 | How | multiplies by a power of ten and rounds to an integer, keeping the values that do not round-trip as exceptions | cuts every value in two, dictionary-encodes the leading bits and keeps the rest verbatim |
 | Yields | integers spanning the range of the input, to compress further with frame-of-reference and bit-packing | 1 to 3 bits per left part, plus the cut point's worth of right part: 49 bits per `f64` at best, ~54 typically |
 
-Both are lossless, and both are meant to be run a chunk of 1024 values at a time — the granularity
-bit-packing works at.
-
-## Classic ALP
+## ALP
 
 ```rust
 let values = vec![1.234f64, 5.678, 9.0];
