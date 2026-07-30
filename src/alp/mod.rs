@@ -12,10 +12,17 @@ const SAMPLE_SIZE: usize = 32;
 /// without scanning the whole patch index.
 pub const ENCODE_CHUNK_SIZE: usize = 1024;
 
+/// The pair of powers of ten a value is scaled by.
+///
+/// Encoding computes `round(v * 10^e / 10^f)` and decoding undoes it, so the encoded integer keeps
+/// `e - f` decimal digits of the original value. Splitting the scale in two is what lets ALP hold
+/// values that need a large `10^e` to become integral without inflating the integers it emits.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Exponents {
+    /// Power of ten the value is multiplied by before it is rounded to an integer.
     pub e: u8,
+    /// Power of ten the value is divided by before it is rounded, undoing part of `e`.
     pub f: u8,
 }
 
@@ -125,13 +132,27 @@ fn update_bounds<I: Ord + Copy>(bounds: &mut Option<(I, I)>, value: I) {
     }));
 }
 
+/// Main trait for classic-ALP encodable floating-point numbers.
+///
+/// Like the paper, we limit this to the IEEE 754 single-precision (`f32`) and double-precision
+/// (`f64`) floating-point types. The free functions at the crate root ([`encode`], [`decode`], and
+/// the rest) call through to this, and are usually what you want to reach for; the trait itself is
+/// there for code that is generic over the float type.
 pub trait ALPFloat: private::Sealed + Float + Display + 'static {
+    /// The signed integer type of the same width, which values of this type encode to.
     type ALPInt: PrimInt + Display + ToPrimitive;
 
+    /// Number of fractional (mantissa) bits the type holds.
     const FRACTIONAL_BITS: u8;
+    /// Exclusive upper bound on the exponents [`Self::find_best_exponents`] tries, set by the
+    /// largest power of ten [`Self::ALPInt`] can hold.
     const MAX_EXPONENT: u8;
+    /// The value [`Self::fast_round`] adds and subtracts to round without branching: the smallest
+    /// magnitude above which the type holds no fractional part at all.
     const SWEET: Self;
+    /// Powers of ten, `10^i` at index `i`.
     const F10: &'static [Self];
+    /// Inverse powers of ten, `10^-i` at index `i`.
     const IF10: &'static [Self];
 
     /// Rounds to the nearest floating integer by shifting in and out of the low precision range.
@@ -149,6 +170,11 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// Compares bit-wise, so that `NaN`s and signed zeros are distinct values.
     fn is_eq(self, other: Self) -> bool;
 
+    /// Finds the exponent pair with the smallest estimated encoded size.
+    ///
+    /// Inputs longer than a few dozen values are sampled rather than scanned in full, since the
+    /// number of decimal digits a column uses is a property of the column rather than of any one
+    /// value.
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let mut best_exp = Exponents { e: 0, f: 0 };
         let mut best_nbytes: usize = usize::MAX;
@@ -225,6 +251,8 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         encoded_bytes + patch_bytes
     }
 
+    /// Estimates the bytes `encoded` and `patches` occupy once cascaded, assuming the encoded
+    /// values get a frame of reference and are bit-packed, and the patches are stored as they are.
     #[inline]
     fn estimate_encoded_size(encoded: &[Self::ALPInt], patches: &[Self]) -> usize {
         let bits_per_encoded = encoded
@@ -345,6 +373,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         exp
     }
 
+    /// Encodes a single value, rounding up instead of to the nearest integer.
     #[inline]
     fn encode_above(value: Self, exponents: Exponents) -> Self::ALPInt {
         (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
@@ -352,6 +381,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             .as_int()
     }
 
+    /// Encodes a single value, rounding down instead of to the nearest integer.
     #[inline]
     fn encode_below(value: Self, exponents: Exponents) -> Self::ALPInt {
         (value * Self::F10[exponents.e as usize] * Self::IF10[exponents.f as usize])
@@ -409,6 +439,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         })
     }
 
+    /// Decodes a single value, undoing the scaling `exponents` applied.
     #[inline]
     fn decode_single(encoded: Self::ALPInt, exponents: Exponents) -> Self {
         Self::from_int(encoded) * Self::F10[exponents.f as usize] * Self::IF10[exponents.e as usize]

@@ -4,6 +4,7 @@ description = "A pure Rust implementation of Adaptive Lossless floating-Point Co
 version = "0.0.1"
 license = "Apache-2.0"
 repository = "https://github.com/spiraldb/alp"
+documentation = "https://docs.rs/alp"
 readme = "README.md"
 keywords = ["alp", "compression", "floating-point", "codec", "lossless"]
 categories = ["compression"]
@@ -26,6 +27,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 
 [workspace.lints.rust]
 macro_use_extern_crate = "deny"
+missing_docs = "deny"
 redundant_lifetimes = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 unused_lifetimes = "deny"
@@ -62,6 +64,8 @@ manual_assert = "deny"
 manual_is_variant_and = "deny"
 many_single_char_names = "deny"
 mem_forget = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
 multiple_crate_versions = "allow"
 or_fun_call = "deny"
 panic = "deny"
