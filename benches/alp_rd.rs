@@ -2,18 +2,15 @@
 //!
 //! Two things are worth guarding here.
 //!
-//! `RDEncoder::new` rescans the whole sample for every candidate cut point, so its cost currently
-//! scales with the length of the sample. The `encoder_new` group sweeps sample sizes so that a
-//! change which caps that work — by subsampling, say — shows up as the curve flattening. 16K is the
-//! top size because it is the smallest that makes the flattening decisive; larger inputs only
-//! restate the same slope at several times the runtime under instrumentation. The small sizes
-//! matter just as much, since an implementation paying a fixed cost per cut point looks fine on
-//! millions of values and is an order of magnitude slower on the few thousand a caller typically
-//! samples.
+//! `RDEncoder::new` searches for a cut point, and the `encoder_new` group sweeps sample sizes so
+//! that the shape of that cost stays visible: it should flatten out once the sample exceeds the cap
+//! the search subsamples to. 16K is the top size because it is the smallest that makes the
+//! flattening decisive; larger inputs only restate the same curve at several times the runtime under
+//! instrumentation. The small sizes matter just as much, since work the search does per cut point
+//! rather than per value — a lookup table to allocate, a dictionary to hash — is invisible on
+//! millions of values and dominates on the few thousand a caller typically samples.
 //!
-//! Keep each case under 1ms as CodSpeed reports it. Everything here is comfortably inside that once
-//! the sample is capped; the sizes above the cap are the exception, and only until the cap lands —
-//! that overage is the cost being measured.
+//! Keep each case under 1ms as CodSpeed reports it.
 //!
 //! `RDEncoder::split` runs once per chunk over the whole dataset, so `split_chunks` measures it at
 //! the 1024-value chunk size a columnar layout would use.

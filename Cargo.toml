@@ -22,7 +22,6 @@ harness = false
 fastlanes = "0.5"
 itertools = "0.15.0"
 num-traits = "0.2.19"
-rustc-hash = "2.1.1"
 serde = { version = "1", optional = true, features = ["derive"] }
 
 [workspace.lints.rust]
