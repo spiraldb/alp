@@ -1,46 +1,88 @@
 name-template: "$RESOLVED_VERSION"
 tag-template: "$RESOLVED_VERSION"
+
+change-template: "- $TITLE (#$NUMBER) $AUTHORS"
+change-title-escapes: '\<*_&' # Add # and @ to disable mentions, and ` to disable code blocks.
+
+# PR titles here are conventional commits (Renovate's are too), so changes are categorised from the
+# title and nothing needs hand-labelling. Labels are still honoured as an override.
 categories:
-  - title: "⚠️ Breaks"
-    labels:
-      - "break"
-  - title: "🚧 Deprecation"
-    labels:
-      - "deprecation"
-  - title: "✨ Features"
-    labels:
-      - "feature"
-  - title: "🚀 Performance"
-    labels:
-      - "performance"
-  - title: "🐛 Bug Fixes"
-    collapse-after: 8
-    labels:
-      - "fix"
-  - title: "📖 Documentation"
-    labels:
-      - "docs"
-    collapse-after: 3
-  - title: "🧰 Maintenance"
-    labels:
-      - "chore"
-    collapse-after: 3
+  # CI-only churn does not belong in user-facing release notes.
+  - type: "pre-exclude"
+    when:
+      - conventional:
+          type: "ci"
+      - label: "skip-changelog"
 
-version-resolver:
-  major:
-    labels:
-      # We must explicitly label a PR with "major" to trigger a major version bump.
-      - "major"
-  minor:
-    labels:
-      # Any features or breaks will trigger a minor version bump (while we are 0.x)
-      - "feature"
-      - "break"
-  default: patch
+  - title: "⚠️ Breaking Changes"
+    # While alp is 0.0.x, a break moves the minor rather than the major.
+    semver-increment: "minor"
+    exclusive: true
+    when:
+      - conventional:
+          breaking: true
+      - label: "breaking"
 
-exclude-labels:
-  - "skip"
-  - "ci"
+  - title: "Features"
+    exclusive: true
+    when:
+      - conventional:
+          type: "feat"
+      - labels:
+          - "feature"
+          - "enhancement"
+
+  - title: "Performance"
+    exclusive: true
+    when:
+      - conventional:
+          type: "perf"
+
+  # Ahead of Bug Fixes so that Renovate's `fix(deps):` PRs collapse in here instead of drowning out
+  # the real fixes.
+  - title: "Dependencies"
+    collapse-after: 0
+    exclusive: true
+    when:
+      - conventional:
+          scopes:
+            - "deps"
+            - "deps-dev"
+      - label: "dependencies"
+
+  - title: "Bug Fixes"
+    exclusive: true
+    when:
+      - conventional:
+          type: "fix"
+      - labels:
+          - "bug"
+          - "fix"
+
+  - title: "Documentation"
+    collapse-after: 5
+    exclusive: true
+    when:
+      - conventional:
+          type: "docs"
+      - label: "documentation"
+
+  # No `when`, so this is the bucket for everything left over (chore, refactor, test, and any
+  # non-conventional title).
+  - title: "Maintenance"
+    collapse-after: 5
+
+  # Label escape hatches for forcing a bump that the titles would not have produced.
+  - type: "version-resolver"
+    semver-increment: "major"
+    when:
+      label: "major"
+  - type: "version-resolver"
+    semver-increment: "minor"
+    when:
+      label: "minor"
+  - type: "version-resolver"
+    semver-increment: "patch"
 
 template: |
   ## Changes

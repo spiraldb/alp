@@ -1,34 +1,32 @@
 name: Release Drafter
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 on:
   push:
-    branches:
-      - develop
-  workflow_dispatch:
-    # Permits a custom run to create a pre-release
-    inputs:
-      prerelease-identifier:
-        description: "RC identifier (e.g., rc, beta, alpha)"
-        type: string
-        default: "rc"
+    branches: ["develop"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
   update_release_draft:
-    permissions:
-      # write permission is required to create a github release
-      contents: write
+    name: Update Release Draft
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      # Required to create and update the draft release.
+      contents: write
+      # Required to read the pull requests that make up the release notes.
+      pull-requests: read
     steps:
-      - uses: release-drafter/release-drafter@693d20e7c1ce1a81d3a41962f85914253b518449  # v7.3.1
+      # Keeps a draft release up to date as PRs land on develop. Publishing that draft creates the
+      # tag and fires the Publish workflow, which pushes the crate to crates.io.
+      - uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9 # v7.7.0
         with:
           commitish: ${{ github.ref_name }}
-          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease-identifier: ${{ inputs.prerelease-identifier || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
