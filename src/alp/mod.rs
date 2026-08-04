@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 use std::fmt::{Display, Formatter};
-use std::mem::{MaybeUninit, size_of, transmute, transmute_copy};
+use std::mem::{MaybeUninit, size_of};
 
 const SAMPLE_SIZE: usize = 32;
 
@@ -110,7 +110,11 @@ pub fn decode_into<F: ALPFloat>(encoded: &[F::ALPInt], exponents: Exponents, out
     F::decode_into(encoded, exponents, output)
 }
 
-/// Decodes a slice of encoded values in-place, reinterpreting it as a slice of floats.
+/// Decodes a slice of encoded values in-place, leaving each slot holding the bit pattern of the
+/// float it decodes to.
+///
+/// Read the values back with [`ALPFloat::from_int_bits`], or reinterpret the whole buffer as
+/// `[F]` once the slice is decoded.
 #[inline]
 pub fn decode_slice_inplace<F: ALPFloat>(encoded: &mut [F::ALPInt], exponents: Exponents) {
     F::decode_slice_inplace(encoded, exponents)
@@ -164,6 +168,19 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
 
     /// Converts from the integer type back to the float type using `as`.
     fn from_int(n: Self::ALPInt) -> Self;
+
+    /// Reinterprets the float's bit pattern as the integer type of the same width.
+    ///
+    /// This preserves bits rather than value, unlike [`Self::as_int`]. It lets a decoder leave
+    /// floats in a buffer that is still typed as [`Self::ALPInt`], so the reinterpretation of the
+    /// buffer as a whole happens once, at the boundary, instead of per element.
+    fn to_int_bits(self) -> Self::ALPInt;
+
+    /// Reinterprets an integer bit pattern as the float of the same width.
+    ///
+    /// The inverse of [`Self::to_int_bits`], and likewise bit-preserving rather than
+    /// value-preserving, unlike [`Self::from_int`].
+    fn from_int_bits(bits: Self::ALPInt) -> Self;
 
     /// Compares bit-wise, so that `NaN`s and signed zeros are distinct values.
     fn is_eq(self, other: Self) -> bool;
@@ -422,19 +439,19 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         }
     }
 
-    /// Decodes `encoded` in-place, reinterpreting the slice as floats of the same width.
+    /// Decodes `encoded` in-place, leaving each slot holding the bit pattern of the float it
+    /// decodes to.
+    ///
+    /// The slice stays typed as [`Self::ALPInt`], so callers that want the decoded values as
+    /// floats reinterpret the whole buffer once, at the boundary, where its size and alignment
+    /// can be checked. Reinterpreting per element instead would mean a `transmute` between slice
+    /// references, which checks the size of the fat pointer rather than of the element and so
+    /// cannot catch a width mismatch.
     #[inline]
     fn decode_slice_inplace(encoded: &mut [Self::ALPInt], exponents: Exponents) {
-        // SAFETY: `Self` and `Self::ALPInt` have the same size and alignment (f32/i32, f64/i64),
-        // and every bit pattern is valid for both.
-        let decoded: &mut [Self] = unsafe { transmute(encoded) };
-        decoded.iter_mut().for_each(|v| {
-            // SAFETY: as above, we're reading back the integer we have not yet overwritten.
-            *v = Self::decode_single(
-                unsafe { transmute_copy::<Self, Self::ALPInt>(v) },
-                exponents,
-            )
-        })
+        for slot in encoded.iter_mut() {
+            *slot = Self::decode_single(*slot, exponents).to_int_bits();
+        }
     }
 
     /// Decodes a single value, undoing the scaling `exponents` applied.
@@ -586,6 +603,16 @@ impl ALPFloat for f32 {
     }
 
     #[inline]
+    fn to_int_bits(self) -> Self::ALPInt {
+        self.to_bits() as Self::ALPInt
+    }
+
+    #[inline]
+    fn from_int_bits(bits: Self::ALPInt) -> Self {
+        Self::from_bits(bits as u32)
+    }
+
+    #[inline]
     fn is_eq(self, other: Self) -> bool {
         self.to_bits() == other.to_bits()
     }
@@ -662,6 +689,16 @@ impl ALPFloat for f64 {
     }
 
     #[inline]
+    fn to_int_bits(self) -> Self::ALPInt {
+        self.to_bits() as Self::ALPInt
+    }
+
+    #[inline]
+    fn from_int_bits(bits: Self::ALPInt) -> Self {
+        Self::from_bits(bits as u64)
+    }
+
+    #[inline]
     fn is_eq(self, other: Self) -> bool {
         self.to_bits() == other.to_bits()
     }
@@ -735,6 +772,45 @@ mod tests {
         assert_eq!(decode::<f64>(&encoded, exponents), original);
     }
 
+    /// The in-place decoder leaves floats in an integer-typed slice, so the two bit-pattern
+    /// conversions have to be exact inverses for every value, payloads and signed zeros included.
+    #[test]
+    fn int_bits_round_trip() {
+        for value in [
+            0.0f64,
+            -0.0,
+            1.5,
+            -1.5,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ] {
+            assert!(f64::from_int_bits(value.to_int_bits()).is_eq(value));
+        }
+        for value in [0.0f32, -0.0, 1.5, -1.5, f32::MIN, f32::MAX, f32::NAN] {
+            assert!(f32::from_int_bits(value.to_int_bits()).is_eq(value));
+        }
+    }
+
+    /// `decode_slice_inplace` must leave exactly the bits that `decode` produces, since callers
+    /// reinterpret the buffer as floats afterwards rather than converting element by element.
+    #[test]
+    fn decode_slice_inplace_leaves_float_bit_patterns() {
+        let original = vec![1.234f64, 5.678, -9.0, 0.001];
+        let (exponents, encoded, ..) = encode(&original, None);
+        let expected = decode::<f64>(&encoded, exponents);
+
+        let mut inplace = encoded;
+        decode_slice_inplace::<f64>(&mut inplace, exponents);
+
+        let inplace: Vec<f64> = inplace.iter().copied().map(f64::from_int_bits).collect();
+        assert_eq!(inplace, expected);
+        assert_eq!(inplace, original);
+    }
+
     #[test]
     fn decode_matches_decode_single() {
         let original = vec![1.234f32, 5.678, -9.0, 0.001];
@@ -749,8 +825,7 @@ mod tests {
 
         let mut inplace = encoded;
         decode_slice_inplace::<f32>(&mut inplace, exponents);
-        // SAFETY: `i32` and `f32` have the same layout, and the slice now holds decoded floats.
-        let inplace: &[f32] = unsafe { transmute(inplace.as_slice()) };
+        let inplace: Vec<f32> = inplace.iter().copied().map(f32::from_int_bits).collect();
         assert_eq!(inplace, original);
     }
 

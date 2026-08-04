@@ -52,6 +52,15 @@
 //! unsafe { encoded.set_len(values.len()) };
 //!
 //! alp::decode_slice_inplace::<f64>(&mut encoded, exponents);
+//!
+//! // Each slot now holds the bit pattern of the float it decoded to, so the buffer can be
+//! // reinterpreted as `[f64]` in one step, or read back a value at a time:
+//! let decoded: Vec<f64> = encoded
+//!     .iter()
+//!     .copied()
+//!     .map(<f64 as alp::ALPFloat>::from_int_bits)
+//!     .collect();
+//! assert_eq!(decoded, values);
 //! ```
 //!
 //! # ALP-RD
