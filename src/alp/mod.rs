@@ -175,7 +175,6 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// value.
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let mut best_exp = Exponents { e: 0, f: 0 };
-        let mut best_nbytes: usize = usize::MAX;
 
         let sample = (values.len() > SAMPLE_SIZE).then(|| {
             values
@@ -185,9 +184,10 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
                 .collect_vec()
         });
         let sample = sample.as_deref().unwrap_or(values);
+        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(sample, best_exp);
 
         for e in (0..Self::MAX_EXPONENT).rev() {
-            for f in 0..e {
+            for f in 0..=e {
                 let exp = Exponents { e, f };
                 let size = Self::estimate_encoded_size_for_exponents(sample, exp);
                 if size < best_nbytes {
@@ -676,7 +676,7 @@ mod tests {
     // unchanged.
     fn check_estimate_matches<T: ALPFloat>(values: &[T]) {
         for e in 0..T::MAX_EXPONENT {
-            for f in 0..e {
+            for f in 0..=e {
                 let exp = Exponents { e, f };
                 let lightweight = T::estimate_encoded_size_for_exponents(values, exp);
                 let (_, encoded, _, patches, _) = T::encode(values, Some(exp));
@@ -709,6 +709,24 @@ mod tests {
         f32s.extend([1e9, -1e9, 0.0, 123.0]);
         check_estimate_matches(&f32s);
         check_estimate_matches::<f32>(&[1.0 / 3.0; 8]);
+    }
+
+    #[test]
+    fn integer_values_use_identity_exponents() {
+        let f32s = [0.0_f32, 1.0, 42.0, 65_536.0];
+        assert_eq!(find_best_exponents(&f32s), Exponents { e: 0, f: 0 });
+
+        let f64s = [0.0_f64, 1.0, 42.0, 65_536.0];
+        assert_eq!(find_best_exponents(&f64s), Exponents { e: 0, f: 0 });
+    }
+
+    #[test]
+    fn equal_exponents_are_considered() {
+        let values = [3.0000000000000004_f64; 8];
+        let exponents = find_best_exponents(&values);
+
+        assert_eq!(exponents.e, exponents.f);
+        assert_ne!(exponents, Exponents { e: 0, f: 0 });
     }
 
     #[test]
