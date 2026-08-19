@@ -32,8 +32,6 @@ jobs:
         run: cargo doc --all-features --no-deps
       - name: Rust Test
         run: cargo test --workspace --all-features
-      # Nothing else checks that the crate is publishable now that the release runs off a tag, so
-      # verify the packaged sources build here rather than discovering it during a release.
       - name: Rust Package
         run: cargo package --locked
 
