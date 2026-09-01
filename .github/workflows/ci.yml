@@ -32,6 +32,8 @@ jobs:
         run: cargo doc --all-features --no-deps
       - name: Rust Test
         run: cargo test --workspace --all-features
+      - name: Rust Package
+        run: cargo package --locked
 
   bench:
     name: Benchmark
