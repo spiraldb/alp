@@ -225,6 +225,7 @@ pub use alp_rd::*;
 
 mod alp;
 mod alp_rd;
+mod sample;
 
 // Runs the README's examples as doctests, so they cannot drift from the API they demonstrate.
 #[cfg(doctest)]

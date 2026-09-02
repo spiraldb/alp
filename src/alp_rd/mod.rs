@@ -1,8 +1,9 @@
 use crate::Exceptions;
+use crate::sample::SamplePlan;
 use fastlanes::BitPacking;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
 use std::marker::PhantomData;
-use std::ops::{Range, Shl, Shr};
+use std::ops::{Shl, Shr};
 
 /// Returns the number of bits required to represent `value`, with a minimum of one.
 #[inline]
@@ -32,13 +33,11 @@ const MAX_SAMPLE: usize = 4096;
 
 /// Length of each contiguous run of values taken by [`SamplePlan::subsample`].
 ///
-/// Runs, rather than a fixed stride, are what make subsampling safe. A stride of `len / MAX_SAMPLE`
-/// aliases with any periodicity in the input — interleaved coordinate or embedding columns,
-/// round-robin sensor readings — and a strided sample then observes only one phase of the data.
-/// Measured on interleaved values of two very different magnitudes, striding chose cut points 2.9
-/// to 10.7 bits/value worse than a full scan, with 15-40% of the input left un-encodable. Runs come
-/// within 0.03 bits/value of a full scan on the same input, and touch far fewer cache lines than a
-/// wide stride. See `test_subsample_matches_full_scan_on_periodic_data`.
+/// Runs, rather than a fixed stride, are what make subsampling safe against periodic input; see
+/// [`SamplePlan::subsample`]. Measured on interleaved values of two very different magnitudes,
+/// striding chose cut points 2.9 to 10.7 bits/value worse than a full scan, with 15-40% of the
+/// input left un-encodable. Runs of this length come within 0.03 bits/value of a full scan on the
+/// same input. See `test_subsample_matches_full_scan_on_periodic_data`.
 const SAMPLE_BLOCK: usize = 64;
 
 mod private {
@@ -681,69 +680,6 @@ pub fn alp_rd_combine_codes_inplace<T: ALPRDFloat>(
     }
 }
 
-/// Which elements of the input to examine when searching for the best cut point.
-///
-/// A plan is a set of disjoint, ascending, contiguous ranges. It is built once and shared by every
-/// candidate cut point, so the trials all score the same values and their estimates stay
-/// comparable.
-#[derive(Debug)]
-struct SamplePlan {
-    ranges: Vec<Range<usize>>,
-    count: usize,
-}
-
-impl SamplePlan {
-    /// A plan covering every element of a `len`-element input.
-    fn full(len: usize) -> Self {
-        let mut ranges = Vec::new();
-        if len > 0 {
-            ranges.push(0..len);
-        }
-        Self { ranges, count: len }
-    }
-
-    /// A plan covering at most `max_sample` elements of a `len`-element input, as evenly spread
-    /// contiguous runs of `block` values.
-    ///
-    /// Falls back to [`Self::full`] for inputs already at or below `max_sample`.
-    fn subsample(len: usize, max_sample: usize, block: usize) -> Self {
-        let block = block.clamp(1, max_sample.max(1));
-        if len <= max_sample {
-            return Self::full(len);
-        }
-
-        let n_blocks = (max_sample / block).max(1);
-        // `len > max_sample >= n_blocks * block` puts the spacing at `block` or more, so the runs
-        // stay disjoint, and the last one starts at `len - block` or earlier, so all are in bounds.
-        // Multiplying the floored spacing (rather than dividing a product) keeps this from
-        // overflowing on absurd lengths.
-        let spacing = if n_blocks > 1 {
-            (len - block) / (n_blocks - 1)
-        } else {
-            0
-        };
-        let ranges: Vec<Range<usize>> = (0..n_blocks)
-            .map(|i| {
-                let start = i * spacing;
-                start..start + block
-            })
-            .collect();
-
-        let count = ranges.iter().map(Range::len).sum();
-        Self { ranges, count }
-    }
-
-    /// The ranges to sample, ascending and disjoint.
-    fn ranges(&self) -> &[Range<usize>] {
-        &self.ranges
-    }
-
-    /// Total number of elements the plan visits.
-    fn count(&self) -> usize {
-        self.count
-    }
-}
-
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
 /// estimated compressed size, considering only the elements `plan` selects.
 ///
@@ -791,15 +727,9 @@ fn find_best_dictionary<T: ALPRDFloat>(samples: &[T], plan: &SamplePlan) -> ALPR
 /// candidate cut point.
 fn gather_patterns<T: ALPRDFloat>(samples: &[T], plan: &SamplePlan) -> Vec<u16> {
     let shift = (T::BITS - CUT_LIMIT) as u32;
-    let mut patterns = Vec::with_capacity(plan.count());
-    for range in plan.ranges() {
-        patterns.extend(
-            samples[range.start..range.end]
-                .iter()
-                .map(|value| <T as ALPRDFloat>::to_u16(T::to_bits(*value).shr(shift as _))),
-        );
-    }
-    patterns
+    plan.iter(samples)
+        .map(|value| <T as ALPRDFloat>::to_u16(T::to_bits(*value).shr(shift as _)))
+        .collect()
 }
 
 /// Sorts 16-bit keys with a two-digit least-significant-digit radix sort.
@@ -957,9 +887,10 @@ impl ALPRDDictionary {
 #[cfg(test)]
 mod test {
     use super::{
-        ALPRDFloat, CUT_LIMIT, MAX_SAMPLE, REVERSE_SLOTS, ReverseDict, SAMPLE_BLOCK, SamplePlan,
+        ALPRDFloat, CUT_LIMIT, MAX_SAMPLE, REVERSE_SLOTS, ReverseDict, SAMPLE_BLOCK,
         estimate_compression_size, find_best_dictionary, lanes_code, window_code,
     };
+    use crate::sample::SamplePlan;
     use crate::{
         MAX_DICT_SIZE, RDEncoder, alp_rd_apply_patches, alp_rd_combine_codes_inplace,
         alp_rd_combine_inplace, alp_rd_decode, alp_rd_dict_decode_inplace, bit_width,
@@ -1378,54 +1309,6 @@ mod test {
     fn test_from_parts_rejects_oversized_dictionary() {
         // A larger dictionary needs codes wider than the decoder's fast path masks for.
         RDEncoder::from_parts(52, vec![0u16; MAX_DICT_SIZE as usize + 1]);
-    }
-
-    #[test]
-    fn test_sample_plan_covers_short_inputs_fully() {
-        for len in [0usize, 1, 63, 64, 4095, MAX_SAMPLE] {
-            let plan = SamplePlan::subsample(len, MAX_SAMPLE, SAMPLE_BLOCK);
-            assert_eq!(plan.count(), len, "short inputs must be scanned in full");
-            let covered: usize = plan.ranges().iter().map(|r| r.len()).sum();
-            assert_eq!(covered, len);
-        }
-    }
-
-    #[test]
-    fn test_sample_plan_ranges_are_in_bounds_and_disjoint() {
-        // Includes lengths that are and are not multiples of the block and sample sizes.
-        for len in [
-            MAX_SAMPLE + 1,
-            2 * MAX_SAMPLE,
-            3 * MAX_SAMPLE + 1,
-            100_003,
-            1 << 20,
-        ] {
-            let plan = SamplePlan::subsample(len, MAX_SAMPLE, SAMPLE_BLOCK);
-            assert!(
-                plan.count() <= MAX_SAMPLE,
-                "subsampling must honour the MAX_SAMPLE budget for len {len}"
-            );
-            assert_eq!(
-                plan.count(),
-                plan.ranges().iter().map(|r| r.len()).sum::<usize>()
-            );
-
-            let mut prev_end = 0;
-            for range in plan.ranges() {
-                assert!(
-                    range.start >= prev_end,
-                    "ranges must be ascending, disjoint"
-                );
-                assert!(
-                    range.end <= len,
-                    "range {}..{} exceeds {len}",
-                    range.start,
-                    range.end
-                );
-                prev_end = range.end;
-            }
-            assert!(!plan.ranges().is_empty());
-        }
     }
 
     /// Subsampling must not cost compression on data whose distribution is uniform throughout,
