@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/spiraldb/alp/compare/v0.0.3...v0.0.4) - 2026-09-02
+
+### Other
+
+- *(deps)* update rust to nightly-2026-08-30 ([#112](https://github.com/spiraldb/alp/pull/112))
+- *(deps)* update rust to nightly-2026-08-24 ([#109](https://github.com/spiraldb/alp/pull/109))
+
 ## [0.0.3](https://github.com/spiraldb/alp/compare/v0.0.2...v0.0.3) - 2026-08-18
 
 ### Other
