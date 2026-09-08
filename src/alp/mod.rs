@@ -1,9 +1,12 @@
+use crate::sample::SamplePlan;
 use itertools::Itertools;
 use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 use std::fmt::{Display, Formatter};
 use std::mem::{MaybeUninit, size_of, transmute, transmute_copy};
 
-const SAMPLE_SIZE: usize = 32;
+/// Maximum number of values examined per candidate exponent pair.
+const SAMPLE_SIZE: usize = 64;
+const SAMPLE_BLOCK: usize = 8;
 
 /// The number of values encoded per chunk.
 ///
@@ -170,26 +173,20 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
 
     /// Finds the exponent pair with the smallest estimated encoded size.
     ///
-    /// Inputs longer than a few dozen values are sampled rather than scanned in full, since the
-    /// number of decimal digits a column uses is a property of the column rather than of any one
-    /// value.
+    /// Large inputs are sampled in evenly spread contiguous runs to bound search cost.
     fn find_best_exponents(values: &[Self]) -> Exponents {
-        let mut best_exp = Exponents { e: 0, f: 0 };
+        let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
+        let sample: Vec<Self> = plan.iter(values).copied().collect();
 
-        let sample = (values.len() > SAMPLE_SIZE).then(|| {
-            values
-                .iter()
-                .step_by(values.len() / SAMPLE_SIZE)
-                .cloned()
-                .collect_vec()
-        });
-        let sample = sample.as_deref().unwrap_or(values);
-        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(sample, best_exp);
+        let mut best_exp = Exponents { e: 0, f: 0 };
+        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(&sample, best_exp);
 
         for e in (0..Self::MAX_EXPONENT).rev() {
             for f in 0..=e {
                 let exp = Exponents { e, f };
-                let size = Self::estimate_encoded_size_for_exponents(sample, exp);
+                let Some(size) = estimate_encoded_size_within(&sample, exp, best_nbytes) else {
+                    continue;
+                };
                 if size < best_nbytes {
                     best_nbytes = size;
                     best_exp = exp;
@@ -206,47 +203,8 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// [`Self::encode`] plus [`Self::estimate_encoded_size`] but without the per-candidate
     /// allocations.
     fn estimate_encoded_size_for_exponents(values: &[Self], exponents: Exponents) -> usize {
-        // `kept` is the (min, max) over values that round-trip exactly (kept inline by `encode`);
-        // `all` is the (min, max) over every encoded value. `encode` fills patched slots in-range,
-        // so its emitted range is `kept`, except with all values patched (no fill), where `all`
-        // wins.
-        let mut kept: Option<(Self::ALPInt, Self::ALPInt)> = None;
-        let mut all: Option<(Self::ALPInt, Self::ALPInt)> = None;
-        let mut patch_count = 0usize;
-
-        for &value in values {
-            let encoded = Self::encode_single_unchecked(value, exponents);
-            update_bounds(&mut all, encoded);
-            if Self::decode_single(encoded, exponents).is_eq(value) {
-                update_bounds(&mut kept, encoded);
-            } else {
-                patch_count += 1;
-            }
-        }
-
-        let range = if patch_count == values.len() {
-            all
-        } else {
-            kept
-        };
-
-        let bits_per_encoded = range
-            .and_then(|(min, max)| max.checked_sub(&min))
-            .and_then(|range_size| range_size.to_u64())
-            .and_then(|range_size| {
-                range_size
-                    .checked_ilog2()
-                    .map(|bits| (bits + 1) as usize)
-                    .or(Some(0))
-            })
-            .unwrap_or(size_of::<Self::ALPInt>() * 8);
-
-        let encoded_bytes = (values.len() * bits_per_encoded).div_ceil(8);
-        // Each patch is a value plus a position. In practice, patch positions are in
-        // [0, u16::MAX] because of how we chunk.
-        let patch_bytes = patch_count * (size_of::<Self>() + size_of::<u16>());
-
-        encoded_bytes + patch_bytes
+        estimate_encoded_size_within(values, exponents, usize::MAX)
+            .expect("an unbounded estimate always completes")
     }
 
     /// Estimates the bytes `encoded` and `patches` occupy once cascaded, assuming the encoded
@@ -270,11 +228,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             .unwrap_or(size_of::<Self::ALPInt>() * 8);
 
         let encoded_bytes = (encoded.len() * bits_per_encoded).div_ceil(8);
-        // Each patch is a value plus a position. In practice, patch positions are in
-        // [0, u16::MAX] because of how we chunk.
-        let patch_bytes = patches.len() * (size_of::<Self>() + size_of::<u16>());
-
-        encoded_bytes + patch_bytes
+        encoded_bytes + patches.len() * patch_bytes::<Self>()
     }
 
     /// Encodes `values`, finding the best exponents if they are not provided.
@@ -453,6 +407,57 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             .fast_round()
             .as_int()
     }
+}
+
+// Chunking keeps patch positions within `u16`.
+const fn patch_bytes<T>() -> usize {
+    size_of::<T>() + size_of::<u16>()
+}
+
+/// Returns the exact estimate, or `None` once exception costs alone exceed `limit`.
+/// Candidates that could tie the limit must still be scored for exponent tie-breaking.
+fn estimate_encoded_size_within<T: ALPFloat>(
+    values: &[T],
+    exponents: Exponents,
+    limit: usize,
+) -> Option<usize> {
+    // `encode` fills patched slots within the kept range, unless every value is patched.
+    let mut kept: Option<(T::ALPInt, T::ALPInt)> = None;
+    let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
+    let mut patch_count = 0usize;
+
+    for &value in values {
+        let encoded = T::encode_single_unchecked(value, exponents);
+        update_bounds(&mut all, encoded);
+        if T::decode_single(encoded, exponents).is_eq(value) {
+            update_bounds(&mut kept, encoded);
+        } else {
+            patch_count += 1;
+            if patch_count * patch_bytes::<T>() > limit {
+                return None;
+            }
+        }
+    }
+
+    let range = if patch_count == values.len() {
+        all
+    } else {
+        kept
+    };
+
+    let bits_per_encoded = range
+        .and_then(|(min, max)| max.checked_sub(&min))
+        .and_then(|range_size| range_size.to_u64())
+        .and_then(|range_size| {
+            range_size
+                .checked_ilog2()
+                .map(|bits| (bits + 1) as usize)
+                .or(Some(0))
+        })
+        .unwrap_or(size_of::<T::ALPInt>() * 8);
+
+    let encoded_bytes = (values.len() * bits_per_encoded).div_ceil(8);
+    Some(encoded_bytes + patch_count * patch_bytes::<T>())
 }
 
 /// Encodes one chunk into `encoded_output`, which covers the whole array: elements before
@@ -709,6 +714,149 @@ mod tests {
         f32s.extend([1e9, -1e9, 0.0, 123.0]);
         check_estimate_matches(&f32s);
         check_estimate_matches::<f32>(&[1.0 / 3.0; 8]);
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new() -> Self {
+            Self(0x517C_C1B7_2722_0A95)
+        }
+
+        /// A value in `[0, 1)`.
+        fn next_unit(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn next_decimal(&mut self, magnitude: f64, digits: i32) -> f64 {
+            let scale = 10f64.powi(digits);
+            (self.next_unit() * magnitude * scale).round() / scale
+        }
+    }
+
+    /// Exhaustive search without early pruning.
+    fn reference_search<T: ALPFloat>(sample: &[T]) -> Exponents {
+        let mut best_exp = Exponents { e: 0, f: 0 };
+        let mut best_nbytes = T::estimate_encoded_size_for_exponents(sample, best_exp);
+        for e in (0..T::MAX_EXPONENT).rev() {
+            for f in 0..=e {
+                let exp = Exponents { e, f };
+                let size = T::estimate_encoded_size_for_exponents(sample, exp);
+                if size < best_nbytes {
+                    best_nbytes = size;
+                    best_exp = exp;
+                } else if size == best_nbytes && e - f < best_exp.e - best_exp.f {
+                    best_exp = exp;
+                }
+            }
+        }
+        best_exp
+    }
+
+    #[test]
+    fn bounded_search_matches_unbounded_search() {
+        let mut rng = Lcg::new();
+        let shapes: [Vec<f64>; 6] = [
+            (0..SAMPLE_SIZE)
+                .map(|_| rng.next_decimal(1000.0, 2))
+                .collect(),
+            (0..SAMPLE_SIZE).map(|_| rng.next_decimal(1.0, 6)).collect(),
+            (0..SAMPLE_SIZE).map(|_| rng.next_unit()).collect(),
+            (0..SAMPLE_SIZE)
+                .map(|i| rng.next_decimal(100.0, if i % 2 == 0 { 1 } else { 5 }))
+                .collect(),
+            vec![1.0 / 3.0; SAMPLE_SIZE],
+            vec![std::f64::consts::PI, 0.5, -0.0, f64::NAN, 1e17, 2.25],
+        ];
+        for sample in &shapes {
+            assert_eq!(find_best_exponents(sample), reference_search(sample));
+            let f32s: Vec<f32> = sample.iter().map(|&v| v as f32).collect();
+            assert_eq!(find_best_exponents(&f32s), reference_search(&f32s));
+        }
+    }
+
+    #[test]
+    fn bounded_estimate_matches_unbounded_estimate() {
+        let mut rng = Lcg::new();
+        let sample: Vec<f64> = (0..SAMPLE_SIZE)
+            .map(|i| rng.next_decimal(100.0, if i % 4 == 0 { 8 } else { 2 }))
+            .collect();
+        for e in 0..f64::MAX_EXPONENT {
+            for f in 0..=e {
+                let exp = Exponents { e, f };
+                let size = f64::estimate_encoded_size_for_exponents(&sample, exp);
+                assert_eq!(estimate_encoded_size_within(&sample, exp, size), Some(size));
+                assert_eq!(
+                    estimate_encoded_size_within(&sample, exp, usize::MAX),
+                    Some(size)
+                );
+                let patches = (size - {
+                    let (_, encoded, ..) = f64::encode(&sample, Some(exp));
+                    f64::estimate_encoded_size(&encoded, &[])
+                }) / patch_bytes::<f64>();
+                if patches > 0 {
+                    assert_eq!(
+                        estimate_encoded_size_within(
+                            &sample,
+                            exp,
+                            patches * patch_bytes::<f64>() - 1
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    // A strided sample would see only integers and miss the five-decimal values.
+    #[test]
+    fn sampling_is_robust_to_periodic_input() {
+        let mut rng = Lcg::new();
+        for len in [SAMPLE_SIZE * 64, 65_536, 100_003] {
+            let period = len / SAMPLE_SIZE;
+            let values: Vec<f64> = (0..len)
+                .map(|i| {
+                    if i % period == 0 {
+                        rng.next_decimal(1000.0, 0)
+                    } else {
+                        rng.next_decimal(1000.0, 5)
+                    }
+                })
+                .collect();
+
+            let exponents = find_best_exponents(&values);
+            assert_eq!(exponents.e - exponents.f, 5, "len {len}: {exponents}");
+        }
+    }
+
+    #[test]
+    fn sampled_search_matches_full_scan_on_uniform_data() {
+        let mut rng = Lcg::new();
+        for digits in [0, 2, 6] {
+            let values: Vec<f64> = (0..20_000)
+                .map(|_| rng.next_decimal(1000.0, digits))
+                .collect();
+            let sampled = find_best_exponents(&values);
+            let full = reference_search(&values);
+            assert_eq!(
+                sampled.e - sampled.f,
+                full.e - full.f,
+                "{digits} digits: sampled {sampled}, full scan {full}"
+            );
+            // Rounding can still produce exceptions, so compare against the full scan.
+            let (_, _, sampled_patches, ..) = encode(&values, Some(sampled));
+            let (_, _, full_patches, ..) = encode(&values, Some(full));
+            assert!(
+                sampled_patches.len() <= full_patches.len(),
+                "{digits} digits: {} exceptions sampled, {} with a full scan",
+                sampled_patches.len(),
+                full_patches.len()
+            );
+        }
     }
 
     #[test]
