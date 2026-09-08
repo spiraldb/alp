@@ -1,16 +1,8 @@
 //! Subsampling shared by the two encoders' parameter searches.
-//!
-//! Both searches look at a bounded number of values, since the property they are after — how
-//! many decimal digits a column uses, or which leading bits its values share — belongs to the
-//! column rather than to any one value. This module decides which values they look at.
 
 use std::ops::Range;
 
-/// Which elements of an input a parameter search examines.
-///
-/// A plan is a set of disjoint, ascending, contiguous ranges. It is built once and shared by every
-/// candidate the search tries, so the trials all score the same values and their estimates stay
-/// comparable.
+/// Ascending, disjoint ranges reused by every candidate in a parameter search.
 #[derive(Debug)]
 pub(crate) struct SamplePlan {
     ranges: Vec<Range<usize>>,
@@ -18,7 +10,6 @@ pub(crate) struct SamplePlan {
 }
 
 impl SamplePlan {
-    /// A plan covering every element of a `len`-element input.
     pub(crate) fn full(len: usize) -> Self {
         let mut ranges = Vec::new();
         if len > 0 {
@@ -30,11 +21,8 @@ impl SamplePlan {
     /// A plan covering at most `max_sample` elements of a `len`-element input, as evenly spread
     /// contiguous runs of `block` values.
     ///
-    /// Runs, rather than a fixed stride, are what make subsampling safe. A stride of
-    /// `len / max_sample` aliases with any periodicity in the input — interleaved coordinate or
-    /// embedding columns, round-robin sensor readings, a header value every so many rows — and a
-    /// strided sample then observes only one phase of the data. A run sees every phase of any
-    /// period up to its length, and touches far fewer cache lines than a wide stride.
+    /// A fixed stride can repeatedly sample one phase of periodic input. Runs cover every phase
+    /// of periods up to `block` and improve cache locality.
     ///
     /// Falls back to [`Self::full`] for inputs already at or below `max_sample`.
     pub(crate) fn subsample(len: usize, max_sample: usize, block: usize) -> Self {
@@ -44,10 +32,7 @@ impl SamplePlan {
         }
 
         let n_blocks = (max_sample / block).max(1);
-        // `len > max_sample >= n_blocks * block` puts the spacing at `block` or more, so the runs
-        // stay disjoint, and the last one starts at `len - block` or earlier, so all are in bounds.
-        // Multiplying the floored spacing (rather than dividing a product) keeps this from
-        // overflowing on absurd lengths.
+        // Spacing keeps runs disjoint and in bounds; dividing before multiplying avoids overflow.
         let spacing = if n_blocks > 1 {
             (len - block) / (n_blocks - 1)
         } else {
@@ -64,22 +49,16 @@ impl SamplePlan {
         Self { ranges, count }
     }
 
-    /// The ranges to sample, ascending and disjoint.
     #[cfg(test)]
     pub(crate) fn ranges(&self) -> &[Range<usize>] {
         &self.ranges
     }
 
-    /// Total number of elements the plan visits.
     pub(crate) fn count(&self) -> usize {
         self.count
     }
 
-    /// The elements of `values` the plan selects, in input order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the plan was built for a longer input than `values`.
+    /// Selected elements in input order. Panics if a sampled range exceeds `values`.
     pub(crate) fn iter<'a, T>(&'a self, values: &'a [T]) -> impl Iterator<Item = &'a T> + 'a {
         self.ranges
             .iter()
@@ -106,8 +85,6 @@ mod test {
 
     #[test]
     fn test_sample_plan_ranges_are_in_bounds_and_disjoint() {
-        // Includes lengths that are and are not multiples of the block and sample sizes, and a
-        // budget too small to hold more than one block.
         for (max_sample, block) in [(MAX_SAMPLE, BLOCK), (64, 8), (32, 8), (8, 8), (7, 8)] {
             for len in [
                 max_sample + 1,
@@ -147,8 +124,6 @@ mod test {
 
     #[test]
     fn test_sample_plan_spans_the_input() {
-        // The first run starts at the front and the last one ends at the back, so the sample spans
-        // the column rather than its head.
         let len = 100_003;
         let plan = SamplePlan::subsample(len, 64, 8);
         assert_eq!(plan.ranges().len(), 8);

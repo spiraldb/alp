@@ -32,12 +32,6 @@ pub const MAX_DICT_SIZE: u8 = 8;
 const MAX_SAMPLE: usize = 4096;
 
 /// Length of each contiguous run of values taken by [`SamplePlan::subsample`].
-///
-/// Runs, rather than a fixed stride, are what make subsampling safe against periodic input; see
-/// [`SamplePlan::subsample`]. Measured on interleaved values of two very different magnitudes,
-/// striding chose cut points 2.9 to 10.7 bits/value worse than a full scan, with 15-40% of the
-/// input left un-encodable. Runs of this length come within 0.03 bits/value of a full scan on the
-/// same input. See `test_subsample_matches_full_scan_on_periodic_data`.
 const SAMPLE_BLOCK: usize = 64;
 
 mod private {

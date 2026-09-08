@@ -4,18 +4,8 @@ use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
 use std::fmt::{Display, Formatter};
 use std::mem::{MaybeUninit, size_of, transmute, transmute_copy};
 
-/// Number of values [`ALPFloat::find_best_exponents`] examines.
-///
-/// Every candidate exponent pair is tried on every sampled value, so this bounds the cost of the
-/// search: it is the same for a million values as for a few dozen. Eight runs of [`SAMPLE_BLOCK`]
-/// values, as DuckDB's ALP samples eight vectors of a row group.
+/// Maximum number of values examined per candidate exponent pair.
 const SAMPLE_SIZE: usize = 64;
-
-/// Length of each contiguous run of values [`ALPFloat::find_best_exponents`] samples.
-///
-/// Runs, rather than a fixed stride, keep the sample from aliasing with periodic input; see
-/// [`SamplePlan::subsample`]. Values that share a row tend to share a precision, so a short run
-/// costs little breadth, and eight of them spread over the input see eight regions of the column.
 const SAMPLE_BLOCK: usize = 8;
 
 /// The number of values encoded per chunk.
@@ -183,9 +173,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
 
     /// Finds the exponent pair with the smallest estimated encoded size.
     ///
-    /// Inputs longer than a few dozen values are sampled rather than scanned in full, as evenly
-    /// spread contiguous runs of values, since the number of decimal digits a column uses is a
-    /// property of the column rather than of any one value.
+    /// Large inputs are sampled in evenly spread contiguous runs to bound search cost.
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
         let sample: Vec<Self> = plan.iter(values).copied().collect();
@@ -196,8 +184,6 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         for e in (0..Self::MAX_EXPONENT).rev() {
             for f in 0..=e {
                 let exp = Exponents { e, f };
-                // A candidate whose exceptions alone already cost more than the best so far cannot
-                // win, or tie, so the estimate gives up on it part-way through the sample.
                 let Some(size) = estimate_encoded_size_within(&sample, exp, best_nbytes) else {
                     continue;
                 };
@@ -423,30 +409,19 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     }
 }
 
-/// Bytes one exception costs: its value at full precision, plus a position.
-///
-/// In practice, patch positions are in `[0, u16::MAX]` because of how we chunk.
+// Chunking keeps patch positions within `u16`.
 const fn patch_bytes<T>() -> usize {
     size_of::<T>() + size_of::<u16>()
 }
 
-/// [`ALPFloat::estimate_encoded_size_for_exponents`], giving up as soon as the exceptions alone
-/// cost more than `limit` bytes.
-///
-/// Returns `None` for a candidate that cannot come in at or under `limit`, so a search can pass
-/// its best size so far and skip the rest of the sample for every pair that has already lost.
-/// The bound is exact: every exception adds [`patch_bytes`] to the final estimate, so a running
-/// exception cost above `limit` puts the total above it too, and a candidate that is not
-/// abandoned is scored exactly as the unbounded estimate would.
+/// Returns the exact estimate, or `None` once exception costs alone exceed `limit`.
+/// Candidates that could tie the limit must still be scored for exponent tie-breaking.
 fn estimate_encoded_size_within<T: ALPFloat>(
     values: &[T],
     exponents: Exponents,
     limit: usize,
 ) -> Option<usize> {
-    // `kept` is the (min, max) over values that round-trip exactly (kept inline by `encode`);
-    // `all` is the (min, max) over every encoded value. `encode` fills patched slots in-range,
-    // so its emitted range is `kept`, except with all values patched (no fill), where `all`
-    // wins.
+    // `encode` fills patched slots within the kept range, unless every value is patched.
     let mut kept: Option<(T::ALPInt, T::ALPInt)> = None;
     let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
     let mut patch_count = 0usize;
@@ -741,7 +716,6 @@ mod tests {
         check_estimate_matches::<f32>(&[1.0 / 3.0; 8]);
     }
 
-    /// A small linear congruential generator, so the tests need no extra dependencies.
     struct Lcg(u64);
 
     impl Lcg {
@@ -758,14 +732,13 @@ mod tests {
             (self.0 >> 11) as f64 / (1u64 << 53) as f64
         }
 
-        /// A value with `digits` decimal places, below `magnitude`.
         fn next_decimal(&mut self, magnitude: f64, digits: i32) -> f64 {
             let scale = 10f64.powi(digits);
             (self.next_unit() * magnitude * scale).round() / scale
         }
     }
 
-    /// The search, without the bound that lets it abandon losing candidates early.
+    /// Exhaustive search without early pruning.
     fn reference_search<T: ALPFloat>(sample: &[T]) -> Exponents {
         let mut best_exp = Exponents { e: 0, f: 0 };
         let mut best_nbytes = T::estimate_encoded_size_for_exponents(sample, best_exp);
@@ -784,8 +757,6 @@ mod tests {
         best_exp
     }
 
-    // Abandoning candidates part-way must not change what the search picks: the bound is a proof
-    // that the candidate has lost, not a heuristic.
     #[test]
     fn bounded_search_matches_unbounded_search() {
         let mut rng = Lcg::new();
@@ -823,7 +794,6 @@ mod tests {
                     estimate_encoded_size_within(&sample, exp, usize::MAX),
                     Some(size)
                 );
-                // Too tight a bound gives up exactly when the exceptions alone exceed it.
                 let patches = (size - {
                     let (_, encoded, ..) = f64::encode(&sample, Some(exp));
                     f64::estimate_encoded_size(&encoded, &[])
@@ -842,10 +812,7 @@ mod tests {
         }
     }
 
-    // A stride of `len / SAMPLE_SIZE` lands on one phase of any input whose period divides it.
-    // Here every value at such a position is an integer while the rest have five decimals, so a
-    // strided sample would see only integers and pick no scaling at all, leaving the rest of the
-    // column as exceptions. Runs see the decimals.
+    // A strided sample would see only integers and miss the five-decimal values.
     #[test]
     fn sampling_is_robust_to_periodic_input() {
         let mut rng = Lcg::new();
@@ -866,8 +833,6 @@ mod tests {
         }
     }
 
-    // Sampling must not cost compression on data whose precision is uniform throughout, which is
-    // the case classic ALP is for.
     #[test]
     fn sampled_search_matches_full_scan_on_uniform_data() {
         let mut rng = Lcg::new();
@@ -882,8 +847,7 @@ mod tests {
                 full.e - full.f,
                 "{digits} digits: sampled {sampled}, full scan {full}"
             );
-            // A few decimals do not survive the two multiplications at any pair, so compare
-            // exception counts rather than demanding none.
+            // Rounding can still produce exceptions, so compare against the full scan.
             let (_, _, sampled_patches, ..) = encode(&values, Some(sampled));
             let (_, _, full_patches, ..) = encode(&values, Some(full));
             assert!(
