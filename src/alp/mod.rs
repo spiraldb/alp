@@ -355,11 +355,10 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// Decodes `encoded` into a newly allocated vector.
     #[inline]
     fn decode(encoded: &[Self::ALPInt], exponents: Exponents) -> Vec<Self> {
-        let mut values = Vec::with_capacity(encoded.len());
-        for encoded in encoded {
-            values.push(Self::decode_single(*encoded, exponents));
-        }
-        values
+        encoded
+            .iter()
+            .map(|encoded| Self::decode_single(*encoded, exponents))
+            .collect()
     }
 
     /// Decodes `encoded` into `output`.
