@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/spiraldb/alp/compare/v0.0.4...v0.0.5) - 2026-11-03
+
+### Fixed
+
+- *(deps)* update cargo non-major dependencies ([#123](https://github.com/spiraldb/alp/pull/123))
+
+### Other
+
+- *(deps)* update rust to nightly-2026-11-01 ([#137](https://github.com/spiraldb/alp/pull/137))
+- *(deps)* update rust crate criterion to v5.0.3 ([#136](https://github.com/spiraldb/alp/pull/136))
+- *(deps)* update rust to nightly-2026-10-12 ([#130](https://github.com/spiraldb/alp/pull/130))
+- *(deps)* update rust to nightly-2026-09-27 ([#126](https://github.com/spiraldb/alp/pull/126))
+- *(deps)* update rust to nightly-2026-09-21 ([#122](https://github.com/spiraldb/alp/pull/122))
+
 ## [0.0.4](https://github.com/spiraldb/alp/compare/v0.0.3...v0.0.4) - 2026-09-08
 
 ### Other
