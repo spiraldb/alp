@@ -1,6 +1,5 @@
 use crate::Exceptions;
 use crate::sample::SamplePlan;
-use fastlanes::BitPacking;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
 use std::marker::PhantomData;
 use std::ops::{Shl, Shr};
@@ -47,7 +46,7 @@ mod private {
 /// (`f64`) floating-point types.
 pub trait ALPRDFloat: private::Sealed + Float {
     /// The unsigned integer type with the same bit-width as the floating-point type.
-    type UINT: PrimInt + BitPacking + Unsigned + One;
+    type UINT: PrimInt + Unsigned + One;
 
     /// Number of bits the value occupies in registers.
     const BITS: usize = size_of::<Self>() * 8;
