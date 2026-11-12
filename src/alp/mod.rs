@@ -181,18 +181,32 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
         let mut best_exp = Exponents { e: 0, f: 0 };
         let mut best_nbytes = Self::estimate_encoded_size_for_exponents(&sample, best_exp);
 
-        for e in (0..Self::MAX_EXPONENT).rev() {
-            for f in 0..=e {
-                let exp = Exponents { e, f };
-                let Some(size) = estimate_encoded_size_within(&sample, exp, best_nbytes) else {
-                    continue;
-                };
-                if size < best_nbytes {
-                    best_nbytes = size;
-                    best_exp = exp;
-                } else if size == best_nbytes && e - f < best_exp.e - best_exp.f {
-                    best_exp = exp;
-                }
+        let mut consider = |exp: Exponents| {
+            let Some(size) = estimate_encoded_size_within(&sample, exp, best_nbytes) else {
+                return;
+            };
+            let digits = exp.e - exp.f;
+            let best_digits = best_exp.e - best_exp.f;
+            // Preserve the original search's ties: prefer fewer retained decimal digits,
+            // then the initial identity candidate, otherwise the largest exponent.
+            if size < best_nbytes
+                || (size == best_nbytes
+                    && (digits < best_digits
+                        || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e)))
+            {
+                best_nbytes = size;
+                best_exp = exp;
+            }
+        };
+
+        // Common decimal data often works with f=0 and a small exponent. Score these
+        // first to establish a useful bound before visiting the rest of the same space.
+        for e in 1..Self::MAX_EXPONENT {
+            consider(Exponents { e, f: 0 });
+        }
+        for e in (1..Self::MAX_EXPONENT).rev() {
+            for f in 1..=e {
+                consider(Exponents { e, f });
             }
         }
 
@@ -414,7 +428,23 @@ const fn patch_bytes<T>() -> usize {
     size_of::<T>() + size_of::<u16>()
 }
 
-/// Returns the exact estimate, or `None` once exception costs alone exceed `limit`.
+/// Bytes needed for a frame-of-reference encoded range, before exceptions.
+#[inline]
+fn encoded_bytes_for_range<I: PrimInt + ToPrimitive>(len: usize, bounds: Option<(I, I)>) -> usize {
+    let bits = bounds
+        .and_then(|(min, max)| max.checked_sub(&min))
+        .and_then(|range| range.to_u64())
+        .and_then(|range| {
+            range
+                .checked_ilog2()
+                .map(|bits| bits as usize + 1)
+                .or(Some(0))
+        })
+        .unwrap_or(size_of::<I>() * 8);
+    (len * bits).div_ceil(8)
+}
+
+/// Returns the exact estimate, or `None` once a lower bound exceeds `limit`.
 /// Candidates that could tie the limit must still be scored for exponent tie-breaking.
 fn estimate_encoded_size_within<T: ALPFloat>(
     values: &[T],
@@ -426,7 +456,7 @@ fn estimate_encoded_size_within<T: ALPFloat>(
     let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
     let mut patch_count = 0usize;
 
-    for &value in values {
+    for (index, &value) in values.iter().enumerate() {
         let encoded = T::encode_single_unchecked(value, exponents);
         update_bounds(&mut all, encoded);
         if T::decode_single(encoded, exponents).is_eq(value) {
@@ -437,6 +467,17 @@ fn estimate_encoded_size_within<T: ALPFloat>(
                 return None;
             }
         }
+        // Once any value round-trips, the final range includes all kept values seen so far.
+        // Its bit width and the patch count can only grow. Check periodically to avoid
+        // paying for range scoring at every sample, and never reject a possible tie.
+        if limit != usize::MAX
+            && (index + 1) % 8 == 0
+            && kept.is_some()
+            && encoded_bytes_for_range(values.len(), kept) + patch_count * patch_bytes::<T>()
+                > limit
+        {
+            return None;
+        }
     }
 
     let range = if patch_count == values.len() {
@@ -445,18 +486,7 @@ fn estimate_encoded_size_within<T: ALPFloat>(
         kept
     };
 
-    let bits_per_encoded = range
-        .and_then(|(min, max)| max.checked_sub(&min))
-        .and_then(|range_size| range_size.to_u64())
-        .and_then(|range_size| {
-            range_size
-                .checked_ilog2()
-                .map(|bits| (bits + 1) as usize)
-                .or(Some(0))
-        })
-        .unwrap_or(size_of::<T::ALPInt>() * 8);
-
-    let encoded_bytes = (values.len() * bits_per_encoded).div_ceil(8);
+    let encoded_bytes = encoded_bytes_for_range(values.len(), range);
     Some(encoded_bytes + patch_count * patch_bytes::<T>())
 }
 
@@ -497,23 +527,52 @@ fn encode_chunk_unchecked<T: ALPFloat>(
     };
 
     if chunk_patch_count > 0 {
-        // We need to gather the patches for this chunk. Preallocate space for them, plus one
-        // because our loop may attempt to write one past the end.
-        patch_indices.reserve(chunk_patch_count + 1);
-        patch_values.reserve(chunk_patch_count + 1);
+        // Only actual patches are written, so no extra speculative slot is needed.
+        patch_indices.reserve(chunk_patch_count);
+        patch_values.reserve(chunk_patch_count);
 
         // Record the patches in this chunk.
         let patch_indices_mut = patch_indices.spare_capacity_mut();
         let patch_values_mut = patch_values.spare_capacity_mut();
-        let mut chunk_patch_index = 0;
-        for i in num_prev_encoded..encoded_len {
-            let decoded = T::decode_single(encoded_output[i], exp);
-            // `write()` is only safe to call more than once because the values are primitive,
-            // i.e. `Drop` is a no-op.
-            patch_indices_mut[chunk_patch_index].write(i as u64);
-            patch_values_mut[chunk_patch_index].write(chunk[i - num_prev_encoded]);
-            chunk_patch_index += !decoded.is_eq(chunk[i - num_prev_encoded]) as usize;
-        }
+        let chunk_patch_index = if chunk_patch_count == chunk.len() {
+            // No need to decode or scan flags when every value is an exception.
+            for (offset, ((position, patch), &value)) in patch_indices_mut
+                .iter_mut()
+                .zip(patch_values_mut.iter_mut())
+                .zip(chunk)
+                .enumerate()
+            {
+                position.write((num_prev_encoded + offset) as u64);
+                patch.write(value);
+            }
+            chunk.len()
+        } else {
+            // Keep float conversion/comparison separate from compaction so LLVM can
+            // vectorize it. Unused flags remain zero for a partial final chunk.
+            let mut is_exception = [0u8; ENCODE_CHUNK_SIZE];
+            for ((&encoded, &value), exception) in encoded_output[num_prev_encoded..encoded_len]
+                .iter()
+                .zip(chunk)
+                .zip(&mut is_exception)
+            {
+                *exception = u8::from(!T::decode_single(encoded, exp).is_eq(value));
+            }
+            let mut count = 0;
+            let words = &is_exception.as_chunks::<8>().0[..chunk.len().div_ceil(8)];
+            for (block, &flags) in words.iter().enumerate() {
+                // Each byte is 0 or 1. Treating eight bytes as a word lets us skip
+                // clean groups and visit only set bits, in increasing position order.
+                let mut mask = u64::from_le_bytes(flags);
+                while mask != 0 {
+                    let offset = block * 8 + mask.trailing_zeros() as usize / 8;
+                    patch_indices_mut[count].write((num_prev_encoded + offset) as u64);
+                    patch_values_mut[count].write(chunk[offset]);
+                    count += 1;
+                    mask &= mask - 1;
+                }
+            }
+            count
+        };
         assert_eq!(chunk_patch_index, chunk_patch_count);
         // SAFETY: we just initialized `chunk_patch_count` elements in the spare capacity of both
         // vectors, which we reserved above.
@@ -918,6 +977,50 @@ mod tests {
         // SAFETY: `i32` and `f32` have the same layout, and the slice now holds decoded floats.
         let inplace: &[f32] = unsafe { transmute(inplace.as_slice()) };
         assert_eq!(inplace, original);
+    }
+
+    #[test]
+    fn patch_compaction_matches_scalar() {
+        fn check<F: ALPFloat>() {
+            let exp = Exponents { e: 3, f: 0 };
+            let clean = F::from(1.234).expect("finite value fits both float types");
+            let exceptions = [F::nan(), F::infinity(), F::neg_infinity(), -F::zero()];
+            for len in [0, 1, 7, 8, 9, 1023, 1024, 1025, 2049] {
+                for stride in [1, 2, 32, len + 1] {
+                    let mut values = vec![clean; len];
+                    for (index, value) in values.iter_mut().step_by(stride).enumerate() {
+                        *value = exceptions[index % exceptions.len()];
+                    }
+                    // Also exercises an all-exception prefix followed by the first fill value.
+                    if stride == 1 {
+                        values.push(clean);
+                    }
+                    let expected: Vec<u64> = values
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| F::encode_single(**value, exp).is_none())
+                        .map(|(index, _)| index as u64)
+                        .collect();
+                    let (_, encoded, positions, patches, _) = encode(&values, Some(exp));
+                    assert_eq!(positions, expected);
+                    assert_eq!(encoded.len(), values.len());
+                    assert_eq!(patches.len(), positions.len());
+                    let mut decoded = decode::<F>(&encoded, exp);
+                    for (&position, &patch) in positions.iter().zip(&patches) {
+                        assert!(patch.is_eq(values[position as usize]));
+                        decoded[position as usize] = patch;
+                    }
+                    assert!(
+                        decoded
+                            .iter()
+                            .zip(&values)
+                            .all(|(&actual, &value)| actual.is_eq(value))
+                    );
+                }
+            }
+        }
+        check::<f64>();
+        check::<f32>();
     }
 
     #[test]
