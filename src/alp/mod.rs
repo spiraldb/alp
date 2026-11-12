@@ -356,9 +356,19 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     #[inline]
     fn decode(encoded: &[Self::ALPInt], exponents: Exponents) -> Vec<Self> {
         let mut values = Vec::with_capacity(encoded.len());
-        for encoded in encoded {
-            values.push(Self::decode_single(*encoded, exponents));
+        if encoded.is_empty() {
+            return values;
         }
+        let factor = Self::F10[exponents.f as usize];
+        let fraction = Self::IF10[exponents.e as usize];
+        for (output, &value) in values.spare_capacity_mut()[..encoded.len()]
+            .iter_mut()
+            .zip(encoded)
+        {
+            output.write(Self::from_int(value) * factor * fraction);
+        }
+        // SAFETY: the loop initializes exactly `encoded.len()` elements.
+        unsafe { values.set_len(encoded.len()) };
         values
     }
 
@@ -899,6 +909,52 @@ mod tests {
         assert_eq!(chunk_offsets, vec![0, 0]);
 
         assert_eq!(decode::<f64>(&encoded, exponents), original);
+    }
+
+    #[test]
+    fn bulk_decode_matches_scalar_bits() {
+        fn check<F: ALPFloat>(encoded: &[F::ALPInt]) {
+            for e in 0..F::IF10.len() {
+                for f in 0..F::F10.len() {
+                    let exp = Exponents {
+                        e: e as u8,
+                        f: f as u8,
+                    };
+                    for len in [0, 1, 7, 8, 9, encoded.len()] {
+                        let decoded = decode::<F>(&encoded[..len], exp);
+                        let mut into = vec![F::zero(); len];
+                        decode_into::<F>(&encoded[..len], exp, &mut into);
+                        assert_eq!(decoded.len(), len);
+                        for ((&value, &written), &integer) in
+                            decoded.iter().zip(&into).zip(&encoded[..len])
+                        {
+                            let scalar = F::decode_single(integer, exp);
+                            assert!(value.is_eq(scalar));
+                            assert!(written.is_eq(scalar));
+                        }
+                    }
+                }
+            }
+            // Empty slices did not validate exponents before the bulk-loop rewrite either.
+            assert!(
+                decode::<F>(
+                    &[],
+                    Exponents {
+                        e: u8::MAX,
+                        f: u8::MAX
+                    }
+                )
+                .is_empty()
+            );
+        }
+        let mut encoded: Vec<i64> = (0..137)
+            .map(|i| (i as i64).wrapping_mul(0x1234_5678_9abc_def1))
+            .collect();
+        encoded[..5].copy_from_slice(&[i64::MIN, i64::MAX, -1, 0, 1]);
+        check::<f64>(&encoded);
+        let mut encoded: Vec<i32> = encoded.iter().map(|&value| value as i32).collect();
+        encoded[..5].copy_from_slice(&[i32::MIN, i32::MAX, -1, 0, 1]);
+        check::<f32>(&encoded);
     }
 
     #[test]
