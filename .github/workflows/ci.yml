@@ -46,7 +46,7 @@ jobs:
           shared_key: "bench"
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-codspeed@5.0.1
 
@@ -70,7 +70,7 @@ jobs:
           shared_key: "msrv"
 
       - name: Install cargo-msrv
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-msrv@0.19.3
 
