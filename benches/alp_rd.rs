@@ -47,6 +47,23 @@ fn log_normal(len: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Log-normal values with sparse outliers outside an unchanged 64-value training prefix.
+/// Perturb one value in 32, alternating sign and magnitude changes to exercise exception
+/// patching without turning the whole column into exceptions.
+fn perturbed_log_normal(len: usize) -> Vec<f64> {
+    let mut values = log_normal(len);
+    for (outlier, value) in values.iter_mut().skip(64).step_by(32).enumerate() {
+        let scale = match outlier % 4 {
+            0 => -1e-12,
+            1 => 1e12,
+            2 => -1e12,
+            _ => 1e-12,
+        };
+        *value *= scale;
+    }
+    values
+}
+
 /// Values from a single narrow range, so the left parts collapse to a handful of patterns. This is
 /// the case ALP-RD is designed for and where exceptions should be rare.
 fn narrow_range(len: usize) -> Vec<f64> {
@@ -134,8 +151,8 @@ fn bench_decode(c: &mut Criterion) {
 
     // Trained on the same data, so almost nothing excepts: the unpatched fast path.
     let clean = narrow_range(LEN);
-    // Trained on a narrow prefix, so the wider values except: the patched path.
-    let patched = log_normal(LEN);
+    // Train on the unchanged prefix; sparse outliers exercise the patched path.
+    let patched = perturbed_log_normal(LEN);
 
     for (name, values, encoder) in [
         (
@@ -146,6 +163,11 @@ fn bench_decode(c: &mut Criterion) {
         ("patched", &patched, RDEncoder::new(&patched[..64])),
     ] {
         let split = encoder.split(values);
+        assert_eq!(
+            split.left_exceptions().positions().is_empty(),
+            name == "unpatched"
+        );
+        assert_eq!(split.decode(), *values);
         let (left_parts, left_dict, exceptions, right_parts, right_bit_width) = split.into_parts();
         group.bench_function(name, |b| {
             b.iter(|| {
@@ -164,5 +186,25 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_encoder_new, bench_split_chunks, bench_decode);
+/// Full f32 decode through the default implementation, including allocation.
+fn bench_f32_decode(c: &mut Criterion) {
+    let values: Vec<f32> = narrow_range(32768).into_iter().map(|v| v as f32).collect();
+    let encoder = RDEncoder::new(&values[..4096]);
+    let split = encoder.split(&values);
+    assert!(split.left_exceptions().positions().is_empty());
+    let mut group = c.benchmark_group("decode_f32");
+    group.throughput(Throughput::Elements(values.len() as u64));
+    group.bench_function("unpatched", |b| {
+        b.iter(|| black_box(&split).decode());
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_encoder_new,
+    bench_split_chunks,
+    bench_decode,
+    bench_f32_decode
+);
 criterion_main!(benches);
