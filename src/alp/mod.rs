@@ -187,8 +187,8 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             };
             let digits = exp.e - exp.f;
             let best_digits = best_exp.e - best_exp.f;
-            // Preserve the original search's ties: prefer fewer retained decimal digits,
-            // then the initial identity candidate, otherwise the largest exponent.
+            // Break size ties by fewer retained decimal digits, then the identity
+            // candidate (e=f=0), otherwise the largest exponent.
             if size < best_nbytes
                 || (size == best_nbytes
                     && (digits < best_digits
@@ -542,7 +542,6 @@ fn encode_chunk_unchecked<T: ALPFloat>(
     };
 
     if chunk_patch_count > 0 {
-        // Only actual patches are written, so no extra speculative slot is needed.
         patch_indices.reserve(chunk_patch_count);
         patch_values.reserve(chunk_patch_count);
 
@@ -750,9 +749,7 @@ impl ALPFloat for f64 {
 mod tests {
     use super::*;
 
-    // The allocation-free estimate must match a full encode plus estimate for every candidate
-    // exponent pair, so that `find_best_exponents` picks the same exponents and compression is
-    // unchanged.
+    // Each candidate's allocation-free size estimate must match a full encode plus estimate.
     fn check_estimate_matches<T: ALPFloat>(values: &[T]) {
         for e in 0..T::MAX_EXPONENT {
             for f in 0..=e {
