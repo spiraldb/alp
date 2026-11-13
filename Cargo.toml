@@ -16,6 +16,10 @@ exclude = [".github/*"]
 workspace = true
 
 [[bench]]
+name = "alp_encode"
+harness = false
+
+[[bench]]
 name = "alp_rd"
 harness = false
 
