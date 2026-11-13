@@ -19,6 +19,10 @@ workspace = true
 name = "alp_rd"
 harness = false
 
+[[bench]]
+name = "alp_decode"
+harness = false
+
 [dependencies]
 fastlanes = "0.8"
 itertools = "0.15.0"
