@@ -34,6 +34,11 @@ const MAX_SAMPLE: usize = 4096;
 /// Length of each contiguous run of values taken by [`SamplePlan::subsample`].
 const SAMPLE_BLOCK: usize = 64;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+mod avx512;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon;
+
 mod private {
     pub trait Sealed {}
 
@@ -63,6 +68,20 @@ pub trait ALPRDFloat: private::Sealed + Float {
 
     /// Converts a `u16` to the unsigned integer type, widening.
     fn from_u16(value: u16) -> Self::UINT;
+
+    /// Combines codes using an already shifted, zero-padded dictionary.
+    #[doc(hidden)]
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [Self::UINT],
+        codes: &[u16],
+        dictionary: &[Self::UINT; MAX_DICT_SIZE as usize],
+        _shift: usize,
+    ) {
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right = dictionary[code as usize & (MAX_DICT_SIZE as usize - 1)] | *right;
+        }
+    }
 }
 
 impl ALPRDFloat for f64 {
@@ -87,6 +106,32 @@ impl ALPRDFloat for f64 {
     fn from_u16(value: u16) -> Self::UINT {
         value as u64
     }
+
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [u64],
+        codes: &[u16],
+        dictionary: &[u64; 8],
+        _shift: usize,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if right_parts.len() >= 8 {
+            // SAFETY: NEON is enabled for the compilation target. The kernel bounds
+            // accesses by both slice lengths; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes(right_parts, codes, dictionary, _shift) };
+            return;
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        if right_parts.len() >= 8 {
+            // SAFETY: AVX-512F is enabled for the compilation target. The kernel bounds
+            // accesses by both slice lengths.
+            unsafe { avx512::combine_codes(right_parts, codes, dictionary) };
+            return;
+        }
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right |= dictionary[code as usize & 7];
+        }
+    }
 }
 
 impl ALPRDFloat for f32 {
@@ -110,6 +155,25 @@ impl ALPRDFloat for f32 {
     #[inline]
     fn from_u16(value: u16) -> Self::UINT {
         value as u32
+    }
+
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [u32],
+        codes: &[u16],
+        dictionary: &[u32; 8],
+        _shift: usize,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if right_parts.len() >= 8 {
+            // SAFETY: NEON is enabled for the compilation target. The kernel bounds
+            // accesses by both slice lengths; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes_f32(right_parts, codes, dictionary, _shift) };
+            return;
+        }
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right |= dictionary[code as usize & 7];
+        }
     }
 }
 
@@ -666,12 +730,7 @@ pub fn alp_rd_combine_codes_inplace<T: ALPRDFloat>(
         shifted_dict[i] = <T as ALPRDFloat>::from_u16(entry) << shift;
     }
 
-    // Masking keeps the lookup in-bounds without a branch; codes are < dictionary size by
-    // construction.
-    const CODE_MASK: usize = MAX_DICT_SIZE as usize - 1;
-    for (right, code) in right_parts.iter_mut().zip(left_parts.iter().copied()) {
-        *right = shifted_dict[(code as usize) & CODE_MASK] | *right;
-    }
+    T::combine_shifted_codes(right_parts, left_parts, &shifted_dict, shift);
 }
 
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
