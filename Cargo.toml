@@ -80,6 +80,6 @@ unwrap_used = "deny"
 use_debug = "deny"
 
 [dev-dependencies]
-criterion = { package = "codspeed-criterion-compat", version = "5.0.1", default-features = false, features = [
+criterion = { package = "codspeed-criterion-compat", version = "6.0.0", default-features = false, features = [
   "cargo_bench_support",
 ] }
