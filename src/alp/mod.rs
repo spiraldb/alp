@@ -456,7 +456,33 @@ fn estimate_encoded_size_within<T: ALPFloat>(
     let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
     let mut patch_count = 0usize;
 
-    for (index, &value) in values.iter().enumerate() {
+    let (chunks, remainder) = values.as_chunks::<8>();
+    for chunk in chunks {
+        for &value in chunk {
+            let encoded = T::encode_single_unchecked(value, exponents);
+            update_bounds(&mut all, encoded);
+            if T::decode_single(encoded, exponents).is_eq(value) {
+                update_bounds(&mut kept, encoded);
+            } else {
+                patch_count += 1;
+                if patch_count * patch_bytes::<T>() > limit {
+                    return None;
+                }
+            }
+        }
+        // Once any value round-trips, the final range includes all kept values seen so far.
+        // Its bit width and the patch count can only grow. Check after each full chunk to
+        // avoid paying for range scoring at every sample, and never reject a possible tie.
+        if limit != usize::MAX
+            && kept.is_some()
+            && encoded_bytes_for_range(values.len(), kept) + patch_count * patch_bytes::<T>()
+                > limit
+        {
+            return None;
+        }
+    }
+
+    for &value in remainder {
         let encoded = T::encode_single_unchecked(value, exponents);
         update_bounds(&mut all, encoded);
         if T::decode_single(encoded, exponents).is_eq(value) {
@@ -466,17 +492,6 @@ fn estimate_encoded_size_within<T: ALPFloat>(
             if patch_count * patch_bytes::<T>() > limit {
                 return None;
             }
-        }
-        // Once any value round-trips, the final range includes all kept values seen so far.
-        // Its bit width and the patch count can only grow. Check periodically to avoid
-        // paying for range scoring at every sample, and never reject a possible tie.
-        if limit != usize::MAX
-            && (index + 1) % 8 == 0
-            && kept.is_some()
-            && encoded_bytes_for_range(values.len(), kept) + patch_count * patch_bytes::<T>()
-                > limit
-        {
-            return None;
         }
     }
 
