@@ -34,9 +34,9 @@ const MAX_SAMPLE: usize = 4096;
 /// Length of each contiguous run of values taken by [`SamplePlan::subsample`].
 const SAMPLE_BLOCK: usize = 64;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[cfg(target_arch = "x86_64")]
 mod avx512;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod neon;
@@ -123,24 +123,22 @@ impl ALPRDFloat for f64 {
             unsafe { neon::combine_codes(right_parts, codes, dictionary, _shift) };
             return;
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        if right_parts.len() >= 8 {
-            // SAFETY: AVX-512F is enabled for the compilation target. The kernel bounds
-            // accesses by both slice lengths.
+
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 8 && std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU supports AVX-512F.
             unsafe { avx512::combine_codes(right_parts, codes, dictionary) };
             return;
         }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512f")
-        ))]
+
         // Amortize the register-table setup on short inputs.
-        if right_parts.len() >= 64 {
-            // SAFETY: AVX2 is enabled and the kernel bounds accesses by both slices.
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2.
             unsafe { avx2::combine_codes(right_parts, codes, dictionary) };
             return;
         }
+
         for (right, &code) in right_parts.iter_mut().zip(codes) {
             *right |= dictionary[code as usize & 7];
         }
@@ -184,13 +182,15 @@ impl ALPRDFloat for f32 {
             unsafe { neon::combine_codes_f32(right_parts, codes, dictionary, _shift) };
             return;
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+
         // Amortize the register-table setup on short inputs.
-        if right_parts.len() >= 64 {
-            // SAFETY: AVX2 is enabled and the kernel bounds accesses by both slices.
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2.
             unsafe { avx2::combine_codes_f32(right_parts, codes, dictionary) };
             return;
         }
+
         for (right, &code) in right_parts.iter_mut().zip(codes) {
             *right |= dictionary[code as usize & 7];
         }
