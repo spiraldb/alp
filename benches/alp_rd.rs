@@ -186,17 +186,30 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-/// Full f32 decode through the default implementation, including allocation.
+/// Full f32 decode, including allocation and exception patching.
 fn bench_f32_decode(c: &mut Criterion) {
-    let values: Vec<f32> = narrow_range(32768).into_iter().map(|v| v as f32).collect();
-    let encoder = RDEncoder::new(&values[..4096]);
-    let split = encoder.split(&values);
-    assert!(split.left_exceptions().positions().is_empty());
+    const LEN: usize = 1 << 15;
+    let clean: Vec<f32> = narrow_range(LEN).into_iter().map(|v| v as f32).collect();
+    let patched: Vec<f32> = perturbed_log_normal(LEN)
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
     let mut group = c.benchmark_group("decode_f32");
-    group.throughput(Throughput::Elements(values.len() as u64));
-    group.bench_function("unpatched", |b| {
-        b.iter(|| black_box(&split).decode());
-    });
+    group.throughput(Throughput::Elements(LEN as u64));
+    for (name, values, encoder) in [
+        ("unpatched", &clean, RDEncoder::new(&clean[..4096])),
+        ("patched", &patched, RDEncoder::new(&patched[..64])),
+    ] {
+        let split = encoder.split(values);
+        assert_eq!(
+            split.left_exceptions().positions().is_empty(),
+            name == "unpatched"
+        );
+        assert_eq!(split.decode(), *values);
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(&split).decode());
+        });
+    }
     group.finish();
 }
 
