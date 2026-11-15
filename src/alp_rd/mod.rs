@@ -34,6 +34,13 @@ const MAX_SAMPLE: usize = 4096;
 /// Length of each contiguous run of values taken by [`SamplePlan::subsample`].
 const SAMPLE_BLOCK: usize = 64;
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon;
+
 mod private {
     pub trait Sealed {}
 
@@ -63,6 +70,20 @@ pub trait ALPRDFloat: private::Sealed + Float {
 
     /// Converts a `u16` to the unsigned integer type, widening.
     fn from_u16(value: u16) -> Self::UINT;
+
+    /// Combines codes using an already shifted, zero-padded dictionary.
+    #[doc(hidden)]
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [Self::UINT],
+        codes: &[u16],
+        dictionary: &[Self::UINT; MAX_DICT_SIZE as usize],
+        _shift: usize,
+    ) {
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right = dictionary[code as usize & (MAX_DICT_SIZE as usize - 1)] | *right;
+        }
+    }
 }
 
 impl ALPRDFloat for f64 {
@@ -87,6 +108,41 @@ impl ALPRDFloat for f64 {
     fn from_u16(value: u16) -> Self::UINT {
         value as u64
     }
+
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [u64],
+        codes: &[u16],
+        dictionary: &[u64; 8],
+        _shift: usize,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if right_parts.len() >= 8 {
+            // SAFETY: NEON is enabled for the compilation target. The kernel bounds
+            // accesses by both slice lengths; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes(right_parts, codes, dictionary, _shift) };
+            return;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 8 && std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU supports AVX-512F.
+            unsafe { avx512::combine_codes(right_parts, codes, dictionary) };
+            return;
+        }
+
+        // Amortize the register-table setup on short inputs.
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2.
+            unsafe { avx2::combine_codes(right_parts, codes, dictionary) };
+            return;
+        }
+
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right |= dictionary[code as usize & 7];
+        }
+    }
 }
 
 impl ALPRDFloat for f32 {
@@ -110,6 +166,34 @@ impl ALPRDFloat for f32 {
     #[inline]
     fn from_u16(value: u16) -> Self::UINT {
         value as u32
+    }
+
+    #[inline]
+    fn combine_shifted_codes(
+        right_parts: &mut [u32],
+        codes: &[u16],
+        dictionary: &[u32; 8],
+        _shift: usize,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if right_parts.len() >= 8 {
+            // SAFETY: NEON is enabled for the compilation target. The kernel bounds
+            // accesses by both slice lengths; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes_f32(right_parts, codes, dictionary, _shift) };
+            return;
+        }
+
+        // Amortize the register-table setup on short inputs.
+        #[cfg(target_arch = "x86_64")]
+        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2.
+            unsafe { avx2::combine_codes_f32(right_parts, codes, dictionary) };
+            return;
+        }
+
+        for (right, &code) in right_parts.iter_mut().zip(codes) {
+            *right |= dictionary[code as usize & 7];
+        }
     }
 }
 
@@ -666,12 +750,7 @@ pub fn alp_rd_combine_codes_inplace<T: ALPRDFloat>(
         shifted_dict[i] = <T as ALPRDFloat>::from_u16(entry) << shift;
     }
 
-    // Masking keeps the lookup in-bounds without a branch; codes are < dictionary size by
-    // construction.
-    const CODE_MASK: usize = MAX_DICT_SIZE as usize - 1;
-    for (right, code) in right_parts.iter_mut().zip(left_parts.iter().copied()) {
-        *right = shifted_dict[(code as usize) & CODE_MASK] | *right;
-    }
+    T::combine_shifted_codes(right_parts, left_parts, &shifted_dict, shift);
 }
 
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
@@ -1254,32 +1333,123 @@ mod test {
         assert_eq!(decoded, values);
     }
 
-    #[test]
-    fn test_combine_codes_matches_combine() {
-        let values = vec![1.12345f64, 2.34567f64, 3.45678f64];
-        let encoder = RDEncoder::new(&values);
-        let (left_parts, right_parts, exc_pos, _) = encoder.split_parts(&values);
-        assert!(exc_pos.is_empty());
+    // Test the public boundary once for every compiled backend, including the scalar fallback.
+    // Integer expectations also cover NaN payloads and signed zero without float equality.
+    macro_rules! decode_contract {
+        ($combine:ident, $roundtrip:ident, $float:ty, $uint:ty) => {
+            #[test]
+            fn $combine() {
+                for shift in 0..<$uint>::BITS {
+                    for dict_len in 0..=8 {
+                        let dict: Vec<u16> = (0..dict_len)
+                            .map(|i| 0x8001u16.wrapping_add(i * 311))
+                            .collect();
+                        for len in (0..=33)
+                            .chain(63..=81)
+                            .chain([127, 128, 137, 1023, 1024, 1025])
+                        {
+                            for offset in 0..8 {
+                                let codes: Vec<u16> = (0..len + offset)
+                                    .map(|i| (i as u16).wrapping_mul(7919))
+                                    .collect();
+                                let mut right: Vec<$uint> = (0..len + offset + 8)
+                                    .map(|i| {
+                                        (i as $uint).wrapping_mul(0x1234_5678_9abc_def1u64 as $uint)
+                                    })
+                                    .collect();
+                                let mut expected = right.clone();
+                                for (low, &code) in expected[offset..offset + len]
+                                    .iter_mut()
+                                    .zip(&codes[offset..])
+                                {
+                                    let left = dict.get(code as usize & 7).copied().unwrap_or(0);
+                                    *low |= (left as $uint) << shift;
+                                }
+                                alp_rd_combine_codes_inplace::<$float>(
+                                    &mut right[offset..offset + len],
+                                    &codes[offset..],
+                                    &dict,
+                                    shift as u8,
+                                );
+                                // Prefix and suffix canaries must also remain untouched.
+                                assert_eq!(
+                                    right, expected,
+                                    "shift {shift}, len {len}, offset {offset}"
+                                );
+                            }
+                        }
+                    }
+                }
 
-        let mut fast = right_parts.clone();
-        alp_rd_combine_codes_inplace::<f64>(
-            &mut fast,
-            &left_parts,
-            encoder.codes(),
-            encoder.right_bit_width(),
-        );
+                // Every u16 code must use exactly its low three bits.
+                let codes: Vec<u16> = (0..=u16::MAX).collect();
+                let dict = [0x8001u16, 7, 0xffff, 31, 123, 0x7f80, 0, 0x1234];
+                let mut right = vec![0; codes.len()];
+                alp_rd_combine_codes_inplace::<$float>(&mut right, &codes, &dict, 0);
+                let expected: Vec<$uint> = codes
+                    .iter()
+                    .map(|&code| dict[code as usize & 7] as $uint)
+                    .collect();
+                assert_eq!(right, expected);
+            }
 
-        let mut left = left_parts;
-        alp_rd_dict_decode_inplace(&mut left, encoder.codes());
-        let mut slow = right_parts;
-        alp_rd_combine_inplace::<f64>(&mut slow, &left, encoder.right_bit_width());
-
-        assert_eq!(fast, slow);
-        assert_eq!(
-            fast.into_iter().map(f64::from_bits).collect::<Vec<_>>(),
-            values
-        );
+            #[test]
+            fn $roundtrip() {
+                let shift = (<$uint>::BITS - 16) as u8;
+                // Include both zeros, infinities, subnormals and distinct NaN payloads.
+                let infinity = (<$float>::INFINITY.to_bits() >> shift) as u16;
+                let nan = (<$float>::NAN.to_bits() >> shift) as u16;
+                let dict = vec![
+                    0,
+                    0x8000,
+                    infinity,
+                    infinity | 0x8000,
+                    nan,
+                    nan | 0x8000,
+                    1,
+                    0x3f80,
+                ];
+                let encoder = RDEncoder::from_parts(shift, dict.clone());
+                for patched in [false, true] {
+                    let mut state = 0x517c_c1b7_2722_0a95u64;
+                    let bits: Vec<$uint> = (0..1027)
+                        .map(|i| {
+                            state = state
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            let left = if patched && i % 31 == 0 {
+                                0x1234
+                            } else {
+                                dict[i % dict.len()]
+                            };
+                            let right = if i < 16 { 0 } else { state as $uint };
+                            ((left as $uint) << shift) | (right & ((1 << shift) - 1))
+                        })
+                        .collect();
+                    let values: Vec<$float> =
+                        bits.iter().copied().map(<$float>::from_bits).collect();
+                    let split = encoder.split(&values);
+                    assert_eq!(!split.left_exceptions().positions().is_empty(), patched);
+                    let decoded: Vec<$uint> =
+                        split.decode().into_iter().map(<$float>::to_bits).collect();
+                    assert_eq!(decoded, bits);
+                }
+            }
+        };
     }
+
+    decode_contract!(
+        combine_f64_matches_integer_oracle,
+        decode_f64_preserves_bits,
+        f64,
+        u64
+    );
+    decode_contract!(
+        combine_f32_matches_integer_oracle,
+        decode_f32_preserves_bits,
+        f32,
+        u32
+    );
 
     #[test]
     fn test_apply_patches_with_offset() {
