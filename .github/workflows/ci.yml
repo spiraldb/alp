@@ -36,9 +36,12 @@ jobs:
   bench:
     name: Benchmark
     runs-on: ubuntu-latest
-    # Fork pull requests do not get repository secrets, so CODSPEED_TOKEN would be empty and the
-    # upload would fail. Skip the job there rather than report a red check a contributor cannot fix.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # CodSpeed uses OIDC when GitHub issues an ID token. Fork pull requests do not get one, and then
+    # CodSpeed falls back to a tokenless upload, which it permits for public repositories.
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: spiraldb/actions/.github/actions/setup-rust@a746510eafaa926484c354541cfc49b2ec06cc63 # 0.18.6
@@ -61,7 +64,6 @@ jobs:
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5
         with:
           run: cargo codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
           mode: "simulation"
 
   msrv:
