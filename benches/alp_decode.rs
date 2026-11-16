@@ -21,7 +21,8 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
     let mut group = c.benchmark_group(format!("alp_decode_{name}"));
     group.throughput(Throughput::Elements(LEN as u64));
     group.bench_function("alloc", |b| {
-        b.iter(|| alp::decode::<F>(black_box(&encoded), black_box(exponents)));
+        // Drop the decoded vector after the measurement stops.
+        b.iter_with_large_drop(|| alp::decode::<F>(black_box(&encoded), black_box(exponents)));
     });
     let mut output = vec![F::zero(); LEN];
     group.bench_function("into", |b| {

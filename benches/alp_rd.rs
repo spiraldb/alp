@@ -18,7 +18,7 @@
 #![allow(missing_docs)]
 
 use alp::{RDEncoder, alp_rd_decode};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 /// A small linear congruential generator, to keep the benchmarks dependency-free and repeatable.
@@ -85,30 +85,35 @@ fn interleaved(len: usize) -> Vec<f64> {
 }
 
 /// `RDEncoder::new` should cost about the same regardless of how much sample it is handed.
+///
+/// The encoder owns its dictionary, so each case drops it after the measurement stops.
 fn bench_encoder_new(c: &mut Criterion) {
     let mut group = c.benchmark_group("encoder_new");
 
     for len in [64usize, 1_024, 4_096, 16_384] {
         let values = log_normal(len);
+        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::new("log_normal", len), &values, |b, values| {
-            b.iter(|| RDEncoder::new(black_box(values.as_slice())));
+            b.iter_with_large_drop(|| RDEncoder::new(black_box(values.as_slice())));
         });
     }
 
     for len in [64usize, 1_024, 16_384] {
         let values = narrow_range(len);
+        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(
             BenchmarkId::new("narrow_range", len),
             &values,
-            |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
+            |b, values| b.iter_with_large_drop(|| RDEncoder::new(black_box(values.as_slice()))),
         );
     }
 
     let values = interleaved(16_384);
+    group.throughput(Throughput::Elements(16_384));
     group.bench_with_input(
         BenchmarkId::new("interleaved", 16_384),
         &values,
-        |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
+        |b, values| b.iter_with_large_drop(|| RDEncoder::new(black_box(values.as_slice()))),
     );
 
     group.finish();
@@ -131,11 +136,17 @@ fn bench_split_chunks(c: &mut Criterion) {
     ] {
         let encoder = RDEncoder::new(&values);
         group.bench_function(name, |b| {
-            b.iter(|| {
-                for chunk in values.chunks(CHUNK) {
-                    black_box(encoder.split(black_box(chunk)));
-                }
-            });
+            // Keep the split chunks until the measurement stops, as a caller does, so that their
+            // release is not part of the measured work.
+            b.iter_batched_ref(
+                || Vec::with_capacity(LEN / CHUNK),
+                |splits| {
+                    for chunk in values.chunks(CHUNK) {
+                        splits.push(black_box(&encoder).split(black_box(chunk)));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 
@@ -170,14 +181,15 @@ fn bench_decode(c: &mut Criterion) {
         assert_eq!(split.decode(), *values);
         let (left_parts, left_dict, exceptions, right_parts, right_bit_width) = split.into_parts();
         group.bench_function(name, |b| {
-            b.iter(|| {
+            // Drop the decoded vector after the measurement stops.
+            b.iter_with_large_drop(|| {
                 alp_rd_decode::<f64>(
                     black_box(&left_parts),
                     black_box(&left_dict),
-                    right_bit_width,
+                    black_box(right_bit_width),
                     black_box(&right_parts),
-                    exceptions.positions(),
-                    exceptions.values(),
+                    black_box(exceptions.positions()),
+                    black_box(exceptions.values()),
                 )
             });
         });
@@ -186,7 +198,7 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-/// Full f32 decode, including allocation and exception patching.
+/// Full f32 decode, including allocation and exception patching, but not the release of the result.
 fn bench_f32_decode(c: &mut Criterion) {
     const LEN: usize = 1 << 15;
     let clean: Vec<f32> = narrow_range(LEN).into_iter().map(|v| v as f32).collect();
@@ -207,7 +219,8 @@ fn bench_f32_decode(c: &mut Criterion) {
         );
         assert_eq!(split.decode(), *values);
         group.bench_function(name, |b| {
-            b.iter(|| black_box(&split).decode());
+            // Drop the decoded vector after the measurement stops.
+            b.iter_with_large_drop(|| black_box(&split).decode());
         });
     }
     group.finish();

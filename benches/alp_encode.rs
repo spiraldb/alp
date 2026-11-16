@@ -48,7 +48,10 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
         );
 
         group.bench_function(format!("{case}/alloc"), |b| {
-            b.iter(|| alp::encode::<F>(black_box(input), Some(black_box(exponents))));
+            // Drop the encoded vectors after the measurement stops.
+            b.iter_with_large_drop(|| {
+                alp::encode::<F>(black_box(input), Some(black_box(exponents)))
+            });
         });
         let mut encoded = vec![MaybeUninit::<F::ALPInt>::uninit(); LEN];
         let mut positions = Vec::with_capacity(LEN);
@@ -80,6 +83,7 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
         })
         .collect();
     let mut group = c.benchmark_group(format!("alp_exponent_search_{name}"));
+    group.throughput(Throughput::Elements(LEN as u64));
     for (case, input) in [
         ("clean", &values),
         ("patched", &perturbed),

@@ -63,6 +63,10 @@ b.iter_batched_ref(|| make_big_vec(), |v| v.sort(), BatchSize::SmallInput);
 
 Other values that the closure drops are part of the measurement.
 
+In a local run, these methods keep the results of a full batch until the batch ends. Thus the
+allocator cannot use the same memory again for the next iteration, and the local time of a benchmark
+that allocates can increase. CodSpeed measures one call, so this effect does not occur in CI.
+
 ### Prevent the compiler from removing work
 
 The compiler can fold or remove work when it knows the inputs. Criterion black-boxes the return
