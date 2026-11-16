@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alp"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "codspeed-criterion-compat",
  "fastlanes",
