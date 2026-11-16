@@ -14,86 +14,76 @@ cargo bench --bench alp_decode
 cargo bench --bench alp_decode -- into_16k
 ```
 
-### Separate setup from measured work
+### Give inputs by reference from the setup closure
 
-Construct fixtures before the call to `bench_function`. Only the closure that you pass to `iter` is
-measured:
+Use `iter_batched_ref` for each benchmark. The setup closure gives the inputs, and the measured
+closure takes them by reference:
 
 ```rust
-let values = log_normal(LEN);
-let encoder = RDEncoder::new(&values);
+let encoded = make_encoded();
 
-group.bench_function("log_normal", |b| {
-    b.iter(|| encoder.split(black_box(&values)));
+group.bench_function("alloc", |b| {
+    b.iter_batched_ref(
+        || (encoded.as_slice(), exponents),
+        |(encoded, exponents)| alp::decode::<f64>(encoded, *exponents),
+        BatchSize::SmallInput,
+    );
 });
 ```
 
-Use `iter_batched` when each iteration needs a new input. Criterion calls the setup closure outside
-the measured region:
+This one pattern obeys three rules:
 
-```rust
-b.iter_batched(
-    || values.clone(),
-    |mut values| transform(&mut values),
-    BatchSize::SmallInput,
-);
-```
+- **Setup is not measured.** Construct shared fixtures before the call to `bench_function`, and
+  return references to them from the setup closure. Criterion calls the setup closure outside the
+  measured region.
+- **The compiler cannot remove the work.** The compiler can fold or remove work when it knows the
+  inputs. Criterion black-boxes the value that the setup closure returns and the value that the
+  measured closure returns. Thus calls to `black_box` are not necessary.
+- **Destruction is not measured.** Criterion drops the inputs and the result after the measurement
+  stops. Return the result from the closure. Do not discard it inside the closure.
+
+Do not use `iter` with captured values. Captured values are not black-boxed, and `iter` drops the
+result inside the measured region.
 
 Do the one-time initialization of process state before the first benchmark. Lazy initialization
 inside a measured iteration can be larger than the operation.
 
-### Exclude destruction when it is not part of the operation
+### Make output buffers in the setup closure
 
-`iter` drops the return value of the closure inside the measured region. Thus a benchmark that
-returns a `Vec` from `iter` measures the operation and the release of the `Vec`. Keep that drop only
-when it is part of the cost that you measure, such as an allocate-and-free benchmark.
-
-Use `iter_with_large_drop` to move the drop of the result out of the measured region:
+When the operation writes into a buffer of the caller, make the buffer in the setup closure. The
+allocation and the release of the buffer are then outside the measured region:
 
 ```rust
-b.iter_with_large_drop(|| alp::decode::<f64>(black_box(&encoded), black_box(exponents)));
+b.iter_batched_ref(
+    || (encoded.as_slice(), exponents, vec![0.0f64; LEN]),
+    |(encoded, exponents, output)| alp::decode_into::<f64>(encoded, *exponents, output),
+    BatchSize::LargeInput,
+);
 ```
 
-Use `iter_batched_ref` when the operation changes an input in place. Criterion drops the input and
-the result after the measurement stops:
+Use `BatchSize::LargeInput` when the setup closure allocates. In a local run, Criterion keeps the
+inputs and the results of a full batch until the batch ends, and a large batch of buffers uses much
+memory. CodSpeed ignores the batch size.
+
+### Keep the results of a manual loop
+
+Inside a manual loop, push each result into a vector from the setup closure. The compiler cannot
+discard the earlier iterations, and the results are dropped after the measurement stops:
 
 ```rust
-b.iter_batched_ref(|| make_big_vec(), |v| v.sort(), BatchSize::SmallInput);
+b.iter_batched_ref(
+    || (&encoder, values.as_slice(), Vec::with_capacity(LEN / CHUNK)),
+    |(encoder, values, splits)| {
+        for chunk in values.chunks(CHUNK) {
+            splits.push(encoder.split(chunk));
+        }
+    },
+    BatchSize::SmallInput,
+);
 ```
 
-Other values that the closure drops are part of the measurement.
-
-In a local run, these methods keep the results of a full batch until the batch ends. Thus the
-allocator cannot use the same memory again for the next iteration, and the local time of a benchmark
-that allocates can increase. CodSpeed measures one call, so this effect does not occur in CI.
-
-### Prevent the compiler from removing work
-
-The compiler can fold or remove work when it knows the inputs. Criterion black-boxes the return
-value of the closure and the inputs that the setup closure of `iter_batched` makes. Captured values
-do not get that protection:
-
-```rust
-let encoded = make_encoded();
-b.iter(|| alp::decode::<f64>(&encoded, exponents));
-```
-
-Pass each captured input through `std::hint::black_box`:
-
-```rust
-b.iter(|| alp::decode::<f64>(black_box(&encoded), black_box(exponents)));
-```
-
-Inside a manual loop, black-box each result so that the compiler cannot discard the earlier
-iterations:
-
-```rust
-b.iter(|| {
-    for chunk in values.chunks(CHUNK) {
-        black_box(encoder.split(black_box(chunk)));
-    }
-});
-```
+Other values that the closure drops are part of the measurement. Keep those drops only when they are
+part of the cost that you measure.
 
 ### Choose reproducible inputs
 
@@ -102,8 +92,8 @@ between runs although the code stays the same. `benches/alp_rd.rs` has a small l
 generator, `Lcg`, which keeps the benchmarks repeatable and free of more dependencies.
 
 Choose inputs that do useful work. An empty input or an input with nothing to patch can measure
-mostly the benchmark harness. For very small operations, repeat a fixed quantity of work and
-black-box each result. Set the input size in bytes when you compare `f32` with `f64`.
+mostly the benchmark harness. For very small operations, repeat a fixed quantity of work and keep
+each result. Set the input size in bytes when you compare `f32` with `f64`.
 
 Keep each iteration below 1 ms so that the suite stays practical to run. This is the cost of one
 call of the closure, not the total time of the benchmark binary. Examine the `HEAD` value for each
@@ -126,7 +116,11 @@ for len in [64usize, 1_024, 4_096, 16_384] {
     let values = log_normal(len);
 
     group.bench_with_input(BenchmarkId::new("log_normal", len), &values, |b, values| {
-        b.iter(|| RDEncoder::new(black_box(values.as_slice())));
+        b.iter_batched_ref(
+            || values.as_slice(),
+            |values| RDEncoder::new(values),
+            BatchSize::SmallInput,
+        );
     });
 }
 
