@@ -18,8 +18,7 @@
 #![allow(missing_docs)]
 
 use alp::{RDEncoder, alp_rd_decode};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// A small linear congruential generator, to keep the benchmarks dependency-free and repeatable.
 struct Lcg(u64);
@@ -85,30 +84,51 @@ fn interleaved(len: usize) -> Vec<f64> {
 }
 
 /// `RDEncoder::new` should cost about the same regardless of how much sample it is handed.
+///
+/// The encoder owns its dictionary, so each case drops it after the measurement stops.
 fn bench_encoder_new(c: &mut Criterion) {
     let mut group = c.benchmark_group("encoder_new");
 
     for len in [64usize, 1_024, 4_096, 16_384] {
         let values = log_normal(len);
+        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::new("log_normal", len), &values, |b, values| {
-            b.iter(|| RDEncoder::new(black_box(values.as_slice())));
+            b.iter_batched_ref(
+                || values.as_slice(),
+                |values| RDEncoder::new(values),
+                BatchSize::SmallInput,
+            );
         });
     }
 
     for len in [64usize, 1_024, 16_384] {
         let values = narrow_range(len);
+        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(
             BenchmarkId::new("narrow_range", len),
             &values,
-            |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
+            |b, values| {
+                b.iter_batched_ref(
+                    || values.as_slice(),
+                    |values| RDEncoder::new(values),
+                    BatchSize::SmallInput,
+                );
+            },
         );
     }
 
     let values = interleaved(16_384);
+    group.throughput(Throughput::Elements(16_384));
     group.bench_with_input(
         BenchmarkId::new("interleaved", 16_384),
         &values,
-        |b, values| b.iter(|| RDEncoder::new(black_box(values.as_slice()))),
+        |b, values| {
+            b.iter_batched_ref(
+                || values.as_slice(),
+                |values| RDEncoder::new(values),
+                BatchSize::SmallInput,
+            );
+        },
     );
 
     group.finish();
@@ -116,11 +136,12 @@ fn bench_encoder_new(c: &mut Criterion) {
 
 /// `split` over a run of chunks at the 1024-value chunk size a columnar layout would use.
 ///
-/// 32 chunks, not the whole column: `split` is a linear per-chunk pass, so a longer run restates
-/// the same per-value cost while multiplying the measured time under instrumentation.
+/// 8 chunks, not the whole column: `split` is a linear per-chunk pass, so a longer run restates
+/// the same per-value cost while multiplying the measured time under instrumentation. CodSpeed
+/// reported 1.7 ms for 32 chunks, which is above the 1 ms limit.
 fn bench_split_chunks(c: &mut Criterion) {
     const CHUNK: usize = 1024;
-    const LEN: usize = 32 * CHUNK;
+    const LEN: usize = 8 * CHUNK;
 
     let mut group = c.benchmark_group("split_chunks");
     group.throughput(Throughput::Elements(LEN as u64));
@@ -131,11 +152,17 @@ fn bench_split_chunks(c: &mut Criterion) {
     ] {
         let encoder = RDEncoder::new(&values);
         group.bench_function(name, |b| {
-            b.iter(|| {
-                for chunk in values.chunks(CHUNK) {
-                    black_box(encoder.split(black_box(chunk)));
-                }
-            });
+            // Keep the split chunks until the measurement stops, as a caller does, so that their
+            // release is not part of the measured work.
+            b.iter_batched_ref(
+                || (&encoder, values.as_slice(), Vec::with_capacity(LEN / CHUNK)),
+                |(encoder, values, splits)| {
+                    for chunk in values.chunks(CHUNK) {
+                        splits.push(encoder.split(chunk));
+                    }
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 
@@ -170,23 +197,37 @@ fn bench_decode(c: &mut Criterion) {
         assert_eq!(split.decode(), *values);
         let (left_parts, left_dict, exceptions, right_parts, right_bit_width) = split.into_parts();
         group.bench_function(name, |b| {
-            b.iter(|| {
-                alp_rd_decode::<f64>(
-                    black_box(&left_parts),
-                    black_box(&left_dict),
-                    right_bit_width,
-                    black_box(&right_parts),
-                    exceptions.positions(),
-                    exceptions.values(),
-                )
-            });
+            // Criterion drops the decoded vector after the measurement stops.
+            b.iter_batched_ref(
+                || {
+                    (
+                        left_parts.as_slice(),
+                        left_dict.as_slice(),
+                        right_bit_width,
+                        right_parts.as_slice(),
+                        exceptions.positions(),
+                        exceptions.values(),
+                    )
+                },
+                |(left_parts, left_dict, right_bit_width, right_parts, positions, values)| {
+                    alp_rd_decode::<f64>(
+                        left_parts,
+                        left_dict,
+                        *right_bit_width,
+                        right_parts,
+                        positions,
+                        values,
+                    )
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 
     group.finish();
 }
 
-/// Full f32 decode, including allocation and exception patching.
+/// Full f32 decode, including allocation and exception patching, but not the release of the result.
 fn bench_f32_decode(c: &mut Criterion) {
     const LEN: usize = 1 << 15;
     let clean: Vec<f32> = narrow_range(LEN).into_iter().map(|v| v as f32).collect();
@@ -207,7 +248,8 @@ fn bench_f32_decode(c: &mut Criterion) {
         );
         assert_eq!(split.decode(), *values);
         group.bench_function(name, |b| {
-            b.iter(|| black_box(&split).decode());
+            // Criterion drops the decoded vector after the measurement stops.
+            b.iter_batched_ref(|| &split, |split| split.decode(), BatchSize::SmallInput);
         });
     }
     group.finish();

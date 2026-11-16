@@ -3,8 +3,7 @@
 #![allow(missing_docs)]
 
 use alp::{ALPFloat, Exponents};
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::mem::MaybeUninit;
 
 fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
@@ -47,27 +46,42 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
                 .all(|(&actual, &expected)| actual.is_eq(expected))
         );
 
+        // The setup closure gives each input by reference. Criterion black-boxes the inputs and
+        // drops the encoded vectors after the measurement stops.
         group.bench_function(format!("{case}/alloc"), |b| {
-            b.iter(|| alp::encode::<F>(black_box(input), Some(black_box(exponents))));
+            b.iter_batched_ref(
+                || (input.as_slice(), exponents),
+                |(input, exponents)| alp::encode::<F>(input, Some(*exponents)),
+                BatchSize::SmallInput,
+            );
         });
-        let mut encoded = vec![MaybeUninit::<F::ALPInt>::uninit(); LEN];
-        let mut positions = Vec::with_capacity(LEN);
-        let mut exceptions = Vec::with_capacity(LEN);
-        let mut offsets = Vec::with_capacity(1);
+
+        // The setup closure makes empty output buffers, so their allocation is not part of the
+        // measurement.
         group.bench_function(format!("{case}/into"), |b| {
-            b.iter(|| {
-                positions.clear();
-                exceptions.clear();
-                offsets.clear();
-                alp::encode_into::<F>(
-                    black_box(input),
-                    Some(black_box(exponents)),
-                    black_box(&mut encoded),
-                    black_box(&mut positions),
-                    black_box(&mut exceptions),
-                    black_box(&mut offsets),
-                );
-            });
+            b.iter_batched_ref(
+                || {
+                    (
+                        input.as_slice(),
+                        exponents,
+                        vec![MaybeUninit::<F::ALPInt>::uninit(); LEN],
+                        Vec::with_capacity(LEN),
+                        Vec::with_capacity(LEN),
+                        Vec::with_capacity(1),
+                    )
+                },
+                |(input, exponents, encoded, positions, exceptions, offsets)| {
+                    alp::encode_into::<F>(
+                        input,
+                        Some(*exponents),
+                        encoded,
+                        positions,
+                        exceptions,
+                        offsets,
+                    )
+                },
+                BatchSize::LargeInput,
+            );
         });
     }
     group.finish();
@@ -80,6 +94,7 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
         })
         .collect();
     let mut group = c.benchmark_group(format!("alp_exponent_search_{name}"));
+    group.throughput(Throughput::Elements(LEN as u64));
     for (case, input) in [
         ("clean", &values),
         ("patched", &perturbed),
@@ -87,7 +102,11 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
         ("all_patched", &all_patched),
     ] {
         group.bench_function(case, |b| {
-            b.iter(|| alp::find_best_exponents(black_box(input)));
+            b.iter_batched_ref(
+                || input.as_slice(),
+                |input| alp::find_best_exponents(input),
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();

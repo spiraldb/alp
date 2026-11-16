@@ -3,8 +3,7 @@
 #![allow(missing_docs)]
 
 use alp::{ALPFloat, Exponents};
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
     const LEN: usize = 1024;
@@ -20,41 +19,37 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
 
     let mut group = c.benchmark_group(format!("alp_decode_{name}"));
     group.throughput(Throughput::Elements(LEN as u64));
+    // The setup closure gives each input by reference. Criterion black-boxes the inputs and drops
+    // the decoded vector after the measurement stops.
     group.bench_function("alloc", |b| {
-        b.iter(|| alp::decode::<F>(black_box(&encoded), black_box(exponents)));
+        b.iter_batched_ref(
+            || (encoded.as_slice(), exponents),
+            |(encoded, exponents)| alp::decode::<F>(encoded, *exponents),
+            BatchSize::SmallInput,
+        );
     });
-    let mut output = vec![F::zero(); LEN];
-    group.bench_function("into", |b| {
-        b.iter(|| {
-            alp::decode_into::<F>(
-                black_box(&encoded),
-                black_box(exponents),
-                black_box(&mut output),
-            );
-        });
-    });
+
+    // The setup closure makes the output buffer, so its allocation is not part of the measurement.
     let scaled = Exponents { e: 6, f: 3 };
-    group.bench_function("into_scaled", |b| {
-        b.iter(|| {
-            alp::decode_into::<F>(
-                black_box(&encoded),
-                black_box(scaled),
-                black_box(&mut output),
+    for (case, exp) in [("into", exponents), ("into_scaled", scaled)] {
+        group.bench_function(case, |b| {
+            b.iter_batched_ref(
+                || (encoded.as_slice(), exp, vec![F::zero(); LEN]),
+                |(encoded, exp, output)| alp::decode_into::<F>(encoded, *exp, output),
+                BatchSize::LargeInput,
             );
         });
-    });
+    }
+
     let large: Vec<F::ALPInt> = encoded.iter().copied().cycle().take(16384).collect();
-    let mut large_output = vec![F::zero(); large.len()];
     group.throughput(Throughput::Elements(large.len() as u64));
     for (case, exp) in [("into_16k", exponents), ("into_scaled_16k", scaled)] {
         group.bench_function(case, |b| {
-            b.iter(|| {
-                alp::decode_into::<F>(
-                    black_box(&large),
-                    black_box(exp),
-                    black_box(&mut large_output),
-                );
-            });
+            b.iter_batched_ref(
+                || (large.as_slice(), exp, vec![F::zero(); large.len()]),
+                |(large, exp, output)| alp::decode_into::<F>(large, *exp, output),
+                BatchSize::LargeInput,
+            );
         });
     }
     group.finish();

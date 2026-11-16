@@ -66,13 +66,15 @@ walks through both variants end to end.
 cargo bench
 ```
 
-Results are tracked on [CodSpeed](https://app.codspeed.io/spiraldb/alp).
+Results are tracked on [CodSpeed](https://app.codspeed.io/spiraldb/alp). The
+[benchmarking guide][benchmarking] tells you how to write benchmarks that give reliable results.
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). The ALP-RD implementation draws on the
 MIT-licensed [C++ implementation](https://github.com/cwida/ALP) by the paper's authors.
 
+[benchmarking]: https://github.com/spiraldb/alp/blob/develop/BENCHMARKING.md
 [bit-packing]: https://docs.rs/alp/latest/alp/#bit-packing
 [fastlanes]: https://github.com/spiraldb/fastlanes
 [Vortex]: https://github.com/spiraldb/vortex
