@@ -23,6 +23,10 @@ harness = false
 name = "alp_rd"
 harness = false
 
+[[bench]]
+name = "alp_decode"
+harness = false
+
 [dependencies]
 itertools = "0.15.0"
 num-traits = "0.2.19"
