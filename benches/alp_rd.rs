@@ -121,11 +121,12 @@ fn bench_encoder_new(c: &mut Criterion) {
 
 /// `split` over a run of chunks at the 1024-value chunk size a columnar layout would use.
 ///
-/// 32 chunks, not the whole column: `split` is a linear per-chunk pass, so a longer run restates
-/// the same per-value cost while multiplying the measured time under instrumentation.
+/// 8 chunks, not the whole column: `split` is a linear per-chunk pass, so a longer run restates
+/// the same per-value cost while multiplying the measured time under instrumentation. CodSpeed
+/// reported 1.7 ms for 32 chunks, which is above the 1 ms limit.
 fn bench_split_chunks(c: &mut Criterion) {
     const CHUNK: usize = 1024;
-    const LEN: usize = 32 * CHUNK;
+    const LEN: usize = 8 * CHUNK;
 
     let mut group = c.benchmark_group("split_chunks");
     group.throughput(Throughput::Elements(LEN as u64));
