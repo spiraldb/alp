@@ -495,6 +495,7 @@ impl RDEncoder {
     ///
     /// Panics if the encoder holds no dictionary entries, which only an empty `codes` passed to
     /// [`Self::from_parts`] can produce.
+    #[inline]
     pub fn split<T>(&self, doubles: &[T]) -> Split<T, T::UINT>
     where
         T: ALPRDFloat,
@@ -531,6 +532,7 @@ impl RDEncoder {
     ///
     /// Panics if the encoder holds no dictionary entries, which only an empty `codes` passed to
     /// [`Self::from_parts`] can produce.
+    #[inline]
     pub fn split_parts<T>(&self, doubles: &[T]) -> (Vec<u16>, Vec<T::UINT>, Vec<u64>, Vec<u16>)
     where
         T: ALPRDFloat,
