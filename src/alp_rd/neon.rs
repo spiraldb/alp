@@ -1,11 +1,12 @@
 //! NEON register lookup for eight-entry ALP-RD dictionaries.
 
+use super::CombineBuffers;
 use std::arch::aarch64::*;
 
 /// `dictionary` must contain u16 entries shifted left by `shift`, which must be below 64.
 #[inline]
 pub(super) unsafe fn combine_codes(
-    right: &mut [u64],
+    buffers: CombineBuffers<'_, u64>,
     codes: &[u16],
     dictionary: &[u64; 8],
     shift: usize,
@@ -15,15 +16,15 @@ pub(super) unsafe fn combine_codes(
     // SAFETY: both specializations keep accesses within the input slices and
     // preserve the shifted-u16 dictionary contract.
     if shift >= 48 {
-        unsafe { combine_codes_impl::<true>(right, codes, dictionary, shift) };
+        unsafe { combine_codes_impl::<true>(buffers, codes, dictionary, shift) };
     } else {
-        unsafe { combine_codes_impl::<false>(right, codes, dictionary, shift) };
+        unsafe { combine_codes_impl::<false>(buffers, codes, dictionary, shift) };
     }
 }
 
 #[inline]
 unsafe fn combine_codes_impl<const HIGH: bool>(
-    right: &mut [u64],
+    mut buffers: CombineBuffers<'_, u64>,
     codes: &[u16],
     dictionary: &[u64; 8],
     shift: usize,
@@ -36,9 +37,10 @@ unsafe fn combine_codes_impl<const HIGH: bool>(
     // SAFETY: this module is compiled only when NEON is enabled.
     let shifts = unsafe { vdupq_n_s64(shift as i64) };
     // Keep direct calls through the safe trait hook memory-safe for mismatched lengths.
-    let vector_len = right.len().min(codes.len()) / 8 * 8;
+    let vector_len = buffers.len().min(codes.len()) / 8 * 8;
+    let (right, output) = buffers.pointers();
     for offset in (0..vector_len).step_by(8) {
-        // SAFETY: offset + 8 <= both slice lengths. Each code load reads eight u16;
+        // SAFETY: offset + 8 <= the codes and both buffers. Each code load reads eight u16;
         // each right-part load/store reads/writes two u64 within this eight-element block.
         unsafe {
             let code = vandq_u16(vld1q_u16(codes.as_ptr().add(offset)), vdupq_n_u16(7));
@@ -68,35 +70,34 @@ unsafe fn combine_codes_impl<const HIGH: bool>(
                 ]
             };
             for (pair, value) in widened.into_iter().enumerate() {
-                let dst = right.as_mut_ptr().add(offset + pair * 2);
-                vst1q_u64(dst, vorrq_u64(vld1q_u64(dst), value));
+                let index = offset + pair * 2;
+                let low = vld1q_u64(right.add(index));
+                vst1q_u64(output.add(index), vorrq_u64(low, value));
             }
         }
     }
-    for (low, &code) in right[vector_len..].iter_mut().zip(&codes[vector_len..]) {
-        *low |= dictionary[code as usize & 7];
-    }
+    buffers.combine_tail(codes, dictionary, vector_len);
 }
 
 /// `dictionary` must contain u16 entries shifted left by `shift`, which must be below 32.
 #[inline]
 pub(super) unsafe fn combine_codes_f32(
-    right: &mut [u32],
+    buffers: CombineBuffers<'_, u32>,
     codes: &[u16],
     dictionary: &[u32; 8],
     shift: usize,
 ) {
     // SAFETY: both specializations keep accesses within the input slices.
     if shift >= 16 {
-        unsafe { combine_codes_f32_impl::<true>(right, codes, dictionary, shift) };
+        unsafe { combine_codes_f32_impl::<true>(buffers, codes, dictionary, shift) };
     } else {
-        unsafe { combine_codes_f32_impl::<false>(right, codes, dictionary, shift) };
+        unsafe { combine_codes_f32_impl::<false>(buffers, codes, dictionary, shift) };
     }
 }
 
 #[inline]
 unsafe fn combine_codes_f32_impl<const HIGH: bool>(
-    right: &mut [u32],
+    mut buffers: CombineBuffers<'_, u32>,
     codes: &[u16],
     dictionary: &[u32; 8],
     shift: usize,
@@ -109,10 +110,11 @@ unsafe fn combine_codes_f32_impl<const HIGH: bool>(
     // SAFETY: this module is compiled only when NEON is enabled.
     let shifts = unsafe { vdupq_n_s32(shift as i32) };
     // Keep direct calls through the safe trait hook memory-safe for mismatched lengths.
-    let vector_len = right.len().min(codes.len()) / 8 * 8;
+    let vector_len = buffers.len().min(codes.len()) / 8 * 8;
+    let (right, output) = buffers.pointers();
     for offset in (0..vector_len).step_by(8) {
         // SAFETY: this block reads eight codes and reads/writes eight right parts;
-        // offset + 8 <= both slice lengths. No alignment is required.
+        // offset + 8 <= the codes and both buffers. No alignment is required.
         unsafe {
             let code = vandq_u16(vld1q_u16(codes.as_ptr().add(offset)), vdupq_n_u16(7));
             let indices = vaddq_u8(
@@ -131,12 +133,15 @@ unsafe fn combine_codes_f32_impl<const HIGH: bool>(
                     vshlq_u32(vmovl_high_u16(left), shifts),
                 )
             };
-            let dst = right.as_mut_ptr().add(offset);
-            vst1q_u32(dst, vorrq_u32(vld1q_u32(dst), lo));
-            vst1q_u32(dst.add(4), vorrq_u32(vld1q_u32(dst.add(4)), hi));
+            vst1q_u32(
+                output.add(offset),
+                vorrq_u32(vld1q_u32(right.add(offset)), lo),
+            );
+            vst1q_u32(
+                output.add(offset + 4),
+                vorrq_u32(vld1q_u32(right.add(offset + 4)), hi),
+            );
         }
     }
-    for (low, &code) in right[vector_len..].iter_mut().zip(&codes[vector_len..]) {
-        *low |= dictionary[code as usize & 7];
-    }
+    buffers.combine_tail(codes, dictionary, vector_len);
 }

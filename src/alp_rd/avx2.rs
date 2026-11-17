@@ -1,17 +1,23 @@
 //! Register dictionary lookup for eight-entry ALP-RD dictionaries.
 
+use super::CombineBuffers;
 use std::arch::x86_64::*;
 
-/// All accesses are unaligned and bounded by both slices.
+/// All accesses are unaligned and bounded by the codes and both buffers.
 ///
 /// The caller must make sure that the CPU supports AVX2, either at compile time or with
 /// runtime detection.
 #[target_feature(enable = "avx2")]
-pub(super) fn combine_codes_f32(right: &mut [u32], codes: &[u16], dictionary: &[u32; 8]) {
+pub(super) fn combine_codes_f32(
+    mut buffers: CombineBuffers<'_, u32>,
+    codes: &[u16],
+    dictionary: &[u32; 8],
+) {
     // SAFETY: the dictionary holds 32 readable bytes, with no alignment requirement.
     let table = unsafe { _mm256_loadu_si256(dictionary.as_ptr().cast()) };
 
-    let vector_len = right.len().min(codes.len()) / 8 * 8;
+    let vector_len = buffers.len().min(codes.len()) / 8 * 8;
+    let (right, output) = buffers.pointers();
 
     for offset in (0..vector_len).step_by(8) {
         // SAFETY: offset + 8 <= codes.len(). Read eight codes.
@@ -21,16 +27,14 @@ pub(super) fn combine_codes_f32(right: &mut [u32], codes: &[u16], dictionary: &[
         let indices = _mm256_cvtepu16_epi32(packed);
         let left = _mm256_permutevar8x32_epi32(table, indices);
 
-        // SAFETY: offset + 8 <= right.len(). Read and write eight right parts.
+        // SAFETY: offset + 8 <= both buffer lengths. Read and write eight values.
         unsafe {
-            let dst = right.as_mut_ptr().add(offset).cast();
-            _mm256_storeu_si256(dst, _mm256_or_si256(left, _mm256_loadu_si256(dst)));
+            let low = _mm256_loadu_si256(right.add(offset).cast());
+            _mm256_storeu_si256(output.add(offset).cast(), _mm256_or_si256(left, low));
         }
     }
 
-    for (low, &code) in right[vector_len..].iter_mut().zip(&codes[vector_len..]) {
-        *low |= dictionary[code as usize & 7];
-    }
+    buffers.combine_tail(codes, dictionary, vector_len);
 }
 
 /// Permute the two halves of each dictionary entry separately.
@@ -38,7 +42,11 @@ pub(super) fn combine_codes_f32(right: &mut [u32], codes: &[u16], dictionary: &[
 /// The caller must make sure that the CPU supports AVX2, either at compile time or with
 /// runtime detection.
 #[target_feature(enable = "avx2")]
-pub(super) fn combine_codes(right: &mut [u64], codes: &[u16], dictionary: &[u64; 8]) {
+pub(super) fn combine_codes(
+    mut buffers: CombineBuffers<'_, u64>,
+    codes: &[u16],
+    dictionary: &[u64; 8],
+) {
     let low = dictionary.map(|entry| entry as u32);
     let high = dictionary.map(|entry| (entry >> 32) as u32);
 
@@ -50,7 +58,8 @@ pub(super) fn combine_codes(right: &mut [u64], codes: &[u16], dictionary: &[u64;
         )
     };
 
-    let vector_len = right.len().min(codes.len()) / 8 * 8;
+    let vector_len = buffers.len().min(codes.len()) / 8 * 8;
+    let (right, output) = buffers.pointers();
 
     for offset in (0..vector_len).step_by(8) {
         // SAFETY: offset + 8 <= codes.len(). Read eight codes.
@@ -65,17 +74,15 @@ pub(super) fn combine_codes(right: &mut [u64], codes: &[u16], dictionary: &[u64;
         let first = _mm256_permute2x128_si256::<0x20>(even, odd);
         let second = _mm256_permute2x128_si256::<0x31>(even, odd);
 
-        // SAFETY: offset + 8 <= right.len(). Read and write eight right parts.
+        // SAFETY: offset + 8 <= both buffer lengths. Read and write eight values.
         unsafe {
-            let dst = right.as_mut_ptr().add(offset).cast();
-            _mm256_storeu_si256(dst, _mm256_or_si256(first, _mm256_loadu_si256(dst)));
+            let low = _mm256_loadu_si256(right.add(offset).cast());
+            _mm256_storeu_si256(output.add(offset).cast(), _mm256_or_si256(first, low));
 
-            let dst = right.as_mut_ptr().add(offset + 4).cast();
-            _mm256_storeu_si256(dst, _mm256_or_si256(second, _mm256_loadu_si256(dst)));
+            let low = _mm256_loadu_si256(right.add(offset + 4).cast());
+            _mm256_storeu_si256(output.add(offset + 4).cast(), _mm256_or_si256(second, low));
         }
     }
 
-    for (low, &code) in right[vector_len..].iter_mut().zip(&codes[vector_len..]) {
-        *low |= dictionary[code as usize & 7];
-    }
+    buffers.combine_tail(codes, dictionary, vector_len);
 }
