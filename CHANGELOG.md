@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/spiraldb/alp/compare/v0.0.5...v0.0.6) - 2026-11-17
+
+### Other
+
+- Mark encode entry points and hot loops #[inline] ([#156](https://github.com/spiraldb/alp/pull/156))
+- pin toolchain to stable 1.100.0 ([#155](https://github.com/spiraldb/alp/pull/155))
+- Add benchmarking guide and apply it to the benchmarks ([#153](https://github.com/spiraldb/alp/pull/153))
+
 ## [0.0.5](https://github.com/spiraldb/alp/compare/v0.0.4...v0.0.5) - 2026-11-16
 
 ### Fixed
