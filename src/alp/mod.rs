@@ -129,6 +129,7 @@ pub fn encode_single_unchecked<F: ALPFloat>(value: F, exponents: Exponents) -> F
 }
 
 /// Widens a running `(min, max)` bound to include `value`, seeding it on the first value.
+#[inline]
 fn update_bounds<I: Ord + Copy>(bounds: &mut Option<(I, I)>, value: I) {
     *bounds = Some(bounds.map_or((value, value), |(min, max)| {
         (min.min(value), max.max(value))
@@ -174,6 +175,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// Finds the exponent pair with the smallest estimated encoded size.
     ///
     /// Large inputs are sampled in evenly spread contiguous runs to bound search cost.
+    #[inline]
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
         let sample: Vec<Self> = plan.iter(values).copied().collect();
@@ -301,6 +303,7 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     ///
     /// Panics if `encoded` is not the same length as `values`, or if any of `patch_indices`,
     /// `patch_values` or `chunk_offsets` is non-empty.
+    #[inline]
     fn encode_into(
         values: &[Self],
         exponents: Option<Exponents>,
@@ -445,6 +448,7 @@ fn encoded_bytes_for_range<I: PrimInt + ToPrimitive>(len: usize, bounds: Option<
 
 /// Returns the exact estimate, or `None` once a lower bound exceeds `limit`.
 /// Candidates that could tie the limit must still be scored for exponent tie-breaking.
+#[inline]
 fn estimate_encoded_size_within<T: ALPFloat>(
     values: &[T],
     exponents: Exponents,
@@ -506,6 +510,7 @@ fn estimate_encoded_size_within<T: ALPFloat>(
 
 /// Encodes one chunk into `encoded_output`, which covers the whole array: elements before
 /// `num_prev_encoded` are already initialized, this chunk initializes the next `chunk.len()`.
+#[inline]
 fn encode_chunk_unchecked<T: ALPFloat>(
     chunk: &[T],
     num_prev_encoded: usize,
