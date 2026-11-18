@@ -2,6 +2,7 @@ use crate::Exceptions;
 use crate::sample::SamplePlan;
 use num_traits::{Float, One, PrimInt, Unsigned, Zero};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Shl, Shr};
 
 /// Returns the number of bits required to represent `value`, with a minimum of one.
@@ -41,11 +42,82 @@ mod avx512;
 mod neon;
 
 mod private {
-    pub trait Sealed {}
+    use super::{ALPRDFloat, MAX_DICT_SIZE, MaybeUninit, PrimInt};
 
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
+    // The kernels can overwrite the input or write to an independent output.
+    pub enum CombineBuffers<'a, U> {
+        InPlace(&'a mut [U]),
+        Separate {
+            right: &'a [U],
+            output: &'a mut [MaybeUninit<U>],
+        },
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_feature = "neon")
+    ))]
+    impl<U> CombineBuffers<'_, U> {
+        #[inline]
+        pub(super) fn len(&self) -> usize {
+            match self {
+                Self::InPlace(right) => right.len(),
+                Self::Separate { right, output } => right.len().min(output.len()),
+            }
+        }
+
+        #[inline]
+        pub(super) fn pointers(&mut self) -> (*const U, *mut U) {
+            match self {
+                Self::InPlace(right) => {
+                    let pointer = right.as_mut_ptr();
+                    (pointer.cast_const(), pointer)
+                }
+                Self::Separate { right, output } => (right.as_ptr(), output.as_mut_ptr().cast()),
+            }
+        }
+    }
+
+    impl<U: PrimInt> CombineBuffers<'_, U> {
+        #[inline]
+        pub(super) fn combine_tail(
+            self,
+            codes: &[u16],
+            dictionary: &[U; MAX_DICT_SIZE as usize],
+            start: usize,
+        ) {
+            let codes = &codes[start..];
+            match self {
+                Self::InPlace(right) => {
+                    for (low, &code) in right[start..].iter_mut().zip(codes) {
+                        *low = dictionary[code as usize & 7] | *low;
+                    }
+                }
+                Self::Separate { right, output } => {
+                    for ((dst, &low), &code) in
+                        output[start..].iter_mut().zip(&right[start..]).zip(codes)
+                    {
+                        dst.write(low | dictionary[code as usize & 7]);
+                    }
+                }
+            }
+        }
+    }
+
+    pub trait Sealed {
+        /// Combines the common prefix of the two buffers and the codes, initializing
+        /// the corresponding output slots for separate buffers.
+        fn combine_buffers(
+            buffers: CombineBuffers<'_, Self::UINT>,
+            codes: &[u16],
+            dictionary: &[Self::UINT; MAX_DICT_SIZE as usize],
+            shift: usize,
+        ) where
+            Self: ALPRDFloat;
+    }
 }
+
+use private::CombineBuffers;
 
 /// Main trait for ALP-RD encodable floating-point numbers.
 ///
@@ -77,11 +149,14 @@ pub trait ALPRDFloat: private::Sealed + Float {
         right_parts: &mut [Self::UINT],
         codes: &[u16],
         dictionary: &[Self::UINT; MAX_DICT_SIZE as usize],
-        _shift: usize,
+        shift: usize,
     ) {
-        for (right, &code) in right_parts.iter_mut().zip(codes) {
-            *right = dictionary[code as usize & (MAX_DICT_SIZE as usize - 1)] | *right;
-        }
+        Self::combine_buffers(
+            CombineBuffers::InPlace(right_parts),
+            codes,
+            dictionary,
+            shift,
+        );
     }
 }
 
@@ -107,40 +182,40 @@ impl ALPRDFloat for f64 {
     fn from_u16(value: u16) -> Self::UINT {
         value as u64
     }
+}
 
+impl private::Sealed for f64 {
     #[inline]
-    fn combine_shifted_codes(
-        right_parts: &mut [u64],
+    fn combine_buffers(
+        buffers: CombineBuffers<'_, u64>,
         codes: &[u16],
         dictionary: &[u64; 8],
         _shift: usize,
     ) {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        if right_parts.len() >= 8 {
+        if buffers.len() >= 8 {
             // SAFETY: NEON is enabled for the compilation target. The kernel bounds
-            // accesses by both slice lengths; the dictionary was built from shifted u16s.
-            unsafe { neon::combine_codes(right_parts, codes, dictionary, _shift) };
+            // accesses by the codes and both buffers; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes(buffers, codes, dictionary, _shift) };
             return;
         }
 
         #[cfg(target_arch = "x86_64")]
-        if right_parts.len() >= 8 && std::arch::is_x86_feature_detected!("avx512f") {
+        if buffers.len() >= 8 && std::arch::is_x86_feature_detected!("avx512f") {
             // SAFETY: the CPU supports AVX-512F.
-            unsafe { avx512::combine_codes(right_parts, codes, dictionary) };
+            unsafe { avx512::combine_codes(buffers, codes, dictionary) };
             return;
         }
 
         // Amortize the register-table setup on short inputs.
         #[cfg(target_arch = "x86_64")]
-        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+        if buffers.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU supports AVX2.
-            unsafe { avx2::combine_codes(right_parts, codes, dictionary) };
+            unsafe { avx2::combine_codes(buffers, codes, dictionary) };
             return;
         }
 
-        for (right, &code) in right_parts.iter_mut().zip(codes) {
-            *right |= dictionary[code as usize & 7];
-        }
+        buffers.combine_tail(codes, dictionary, 0);
     }
 }
 
@@ -166,33 +241,33 @@ impl ALPRDFloat for f32 {
     fn from_u16(value: u16) -> Self::UINT {
         value as u32
     }
+}
 
+impl private::Sealed for f32 {
     #[inline]
-    fn combine_shifted_codes(
-        right_parts: &mut [u32],
+    fn combine_buffers(
+        buffers: CombineBuffers<'_, u32>,
         codes: &[u16],
         dictionary: &[u32; 8],
         _shift: usize,
     ) {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        if right_parts.len() >= 8 {
+        if buffers.len() >= 8 {
             // SAFETY: NEON is enabled for the compilation target. The kernel bounds
-            // accesses by both slice lengths; the dictionary was built from shifted u16s.
-            unsafe { neon::combine_codes_f32(right_parts, codes, dictionary, _shift) };
+            // accesses by the codes and both buffers; the dictionary was built from shifted u16s.
+            unsafe { neon::combine_codes_f32(buffers, codes, dictionary, _shift) };
             return;
         }
 
         // Amortize the register-table setup on short inputs.
         #[cfg(target_arch = "x86_64")]
-        if right_parts.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+        if buffers.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU supports AVX2.
-            unsafe { avx2::combine_codes_f32(right_parts, codes, dictionary) };
+            unsafe { avx2::combine_codes_f32(buffers, codes, dictionary) };
             return;
         }
 
-        for (right, &code) in right_parts.iter_mut().zip(codes) {
-            *right |= dictionary[code as usize & 7];
-        }
+        buffers.combine_tail(codes, dictionary, 0);
     }
 }
 
@@ -621,27 +696,31 @@ pub fn alp_rd_decode<T: ALPRDFloat>(
         "alp_rd_decode: exc_pos.len != exceptions.len"
     );
 
-    let mut decoded: Vec<T::UINT> = right_parts.to_vec();
-
     if exc_pos.is_empty() {
-        // Non-patched fast path: every code maps through the dictionary, so we can
-        // pre-shift the entire dictionary once and reduce the per-element hot loop to
-        // a single table lookup + OR.
-        alp_rd_combine_codes_inplace::<T>(
-            &mut decoded,
+        let shift = usize::from(right_bit_width);
+        let dictionary = shifted_dictionary::<T>(left_parts_dict, shift);
+        let mut decoded = Vec::with_capacity(right_parts.len());
+        T::combine_buffers(
+            CombineBuffers::Separate {
+                right: right_parts,
+                output: &mut decoded.spare_capacity_mut()[..right_parts.len()],
+            },
             left_parts,
-            left_parts_dict,
-            right_bit_width,
+            &dictionary,
+            shift,
         );
-    } else {
-        // Patched path: some left-part codes map to exception values that live outside
-        // the dictionary. We must dictionary-decode first, then overwrite the exceptions,
-        // before we can combine with right-parts.
-        let mut left_parts = left_parts.to_vec();
-        alp_rd_dict_decode_inplace(&mut left_parts, left_parts_dict);
-        alp_rd_apply_patches(&mut left_parts, exc_pos, exceptions, 0);
-        alp_rd_combine_inplace::<T>(&mut decoded, &left_parts, right_bit_width);
+        // SAFETY: the input slices have equal lengths and combine_buffers writes one
+        // initialized word per input into the spare capacity.
+        unsafe { decoded.set_len(right_parts.len()) };
+        return decoded.into_iter().map(T::from_bits).collect();
     }
+
+    // Exception codes must be dictionary-decoded and then patched before combining.
+    let mut decoded = right_parts.to_vec();
+    let mut left_parts = left_parts.to_vec();
+    alp_rd_dict_decode_inplace(&mut left_parts, left_parts_dict);
+    alp_rd_apply_patches(&mut left_parts, exc_pos, exceptions, 0);
+    alp_rd_combine_inplace::<T>(&mut decoded, &left_parts, right_bit_width);
 
     decoded.into_iter().map(T::from_bits).collect()
 }
@@ -740,18 +819,26 @@ pub fn alp_rd_combine_codes_inplace<T: ALPRDFloat>(
         right_parts.len(),
         "alp_rd_combine_codes_inplace: left_parts.len != right_parts.len"
     );
+    let shift = usize::from(right_bit_width);
+    let shifted_dict = shifted_dictionary::<T>(left_parts_dict, shift);
+    T::combine_shifted_codes(right_parts, left_parts, &shifted_dict, shift);
+}
+
+#[inline]
+fn shifted_dictionary<T: ALPRDFloat>(
+    dictionary: &[u16],
+    shift: usize,
+) -> [T::UINT; MAX_DICT_SIZE as usize] {
     assert!(
-        left_parts_dict.len() <= MAX_DICT_SIZE as usize,
+        dictionary.len() <= MAX_DICT_SIZE as usize,
         "alp_rd_combine_codes_inplace: dictionary larger than MAX_DICT_SIZE"
     );
 
-    let shift = right_bit_width as usize;
-    let mut shifted_dict = [T::UINT::zero(); MAX_DICT_SIZE as usize];
-    for (i, &entry) in left_parts_dict.iter().enumerate() {
-        shifted_dict[i] = <T as ALPRDFloat>::from_u16(entry) << shift;
+    let mut shifted = [T::UINT::zero(); MAX_DICT_SIZE as usize];
+    for (i, &entry) in dictionary.iter().enumerate() {
+        shifted[i] = <T as ALPRDFloat>::from_u16(entry) << shift;
     }
-
-    T::combine_shifted_codes(right_parts, left_parts, &shifted_dict, shift);
+    shifted
 }
 
 /// Finds the best "cut point" for a set of floating-point values, i.e. the one with the lowest
@@ -1366,6 +1453,22 @@ mod test {
                                     let left = dict.get(code as usize & 7).copied().unwrap_or(0);
                                     *low |= (left as $uint) << shift;
                                 }
+                                let decoded = alp_rd_decode::<$float>(
+                                    &codes[offset..],
+                                    &dict,
+                                    shift as u8,
+                                    &right[offset..offset + len],
+                                    &[],
+                                    &[],
+                                );
+                                assert!(
+                                    decoded
+                                        .into_iter()
+                                        .map(<$float>::to_bits)
+                                        .eq(expected[offset..offset + len].iter().copied()),
+                                    "allocating decode: shift {shift}, len {len}, offset {offset}"
+                                );
+
                                 alp_rd_combine_codes_inplace::<$float>(
                                     &mut right[offset..offset + len],
                                     &codes[offset..],
@@ -1386,11 +1489,18 @@ mod test {
                 let codes: Vec<u16> = (0..=u16::MAX).collect();
                 let dict = [0x8001u16, 7, 0xffff, 31, 123, 0x7f80, 0, 0x1234];
                 let mut right = vec![0; codes.len()];
+                let decoded = alp_rd_decode::<$float>(&codes, &dict, 0, &right, &[], &[]);
                 alp_rd_combine_codes_inplace::<$float>(&mut right, &codes, &dict, 0);
                 let expected: Vec<$uint> = codes
                     .iter()
                     .map(|&code| dict[code as usize & 7] as $uint)
                     .collect();
+                assert!(
+                    decoded
+                        .into_iter()
+                        .map(<$float>::to_bits)
+                        .eq(expected.iter().copied())
+                );
                 assert_eq!(right, expected);
             }
 
