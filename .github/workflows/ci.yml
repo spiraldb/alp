@@ -48,10 +48,8 @@ jobs:
         with:
           shared_key: "bench"
 
-      - name: Install cargo-codspeed
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
-        with:
-          tool: cargo-codspeed@5.0.1
+      - name: Install Codspeed
+        uses: ./.github/actions/setup-codspeed
 
       - name: Build benchmarks
         run: cargo codspeed build --all-features
